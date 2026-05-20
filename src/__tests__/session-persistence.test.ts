@@ -72,27 +72,33 @@ describe("session-persistence", () => {
   });
 
   it("handles localStorage errors gracefully", () => {
-    // Replace setItem directly rather than using vi.spyOn — the
-    // vitest.setup shim installs an own-property setItem (rather
-    // than one on Storage.prototype) when running on Node 20 +
-    // jsdom 29, and vi.spyOn's prototype-based interception
-    // doesn't always wrap it. Direct assignment + manual restore
-    // works against real jsdom AND the shim, on both Node 20 and 24.
-    const originalSetItem = localStorage.setItem;
+    // Force setItem to throw, then verify saveSession swallows it
+    // and warns. Use Object.defineProperty rather than direct
+    // assignment OR vi.spyOn — jsdom 29 on Node 20 makes
+    // `localStorage.setItem = fn` silently fail (the property is
+    // defined as non-writable on Storage.prototype), so direct
+    // assignment creates an own property that doesn't shadow.
+    // defineProperty with `configurable: true` always works.
+    const originalSetItem = localStorage.setItem.bind(localStorage);
     let warnCount = 0;
     const originalWarn = console.warn;
     console.warn = () => { warnCount++; };
-    localStorage.setItem = () => {
-      throw new DOMException("QuotaExceededError");
-    };
+
+    Object.defineProperty(localStorage, "setItem", {
+      value: () => { throw new DOMException("QuotaExceededError"); },
+      configurable: true,
+      writable: true,
+    });
 
     try {
-      // Should not throw — saveSession's try/catch must swallow.
       expect(() => saveSession(makeSession())).not.toThrow();
-      // And it must have logged the failure.
       expect(warnCount).toBeGreaterThan(0);
     } finally {
-      localStorage.setItem = originalSetItem;
+      Object.defineProperty(localStorage, "setItem", {
+        value: originalSetItem,
+        configurable: true,
+        writable: true,
+      });
       console.warn = originalWarn;
     }
   });
