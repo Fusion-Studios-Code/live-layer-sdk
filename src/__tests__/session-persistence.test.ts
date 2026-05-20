@@ -72,22 +72,28 @@ describe("session-persistence", () => {
   });
 
   it("handles localStorage errors gracefully", () => {
-    // Spy on the live `localStorage.setItem` rather than
-    // `Storage.prototype.setItem` — the vitest.setup shim installs a
-    // plain object (not a Storage subclass) when jsdom doesn't
-    // expose a real Storage instance, so prototype-based spies
-    // don't intercept calls. Direct instance spy works against
-    // both real-jsdom and the shim.
-    const spy = vi.spyOn(localStorage, "setItem").mockImplementation(() => {
+    // Replace setItem directly rather than using vi.spyOn — the
+    // vitest.setup shim installs an own-property setItem (rather
+    // than one on Storage.prototype) when running on Node 20 +
+    // jsdom 29, and vi.spyOn's prototype-based interception
+    // doesn't always wrap it. Direct assignment + manual restore
+    // works against real jsdom AND the shim, on both Node 20 and 24.
+    const originalSetItem = localStorage.setItem;
+    let warnCount = 0;
+    const originalWarn = console.warn;
+    console.warn = () => { warnCount++; };
+    localStorage.setItem = () => {
       throw new DOMException("QuotaExceededError");
-    });
-    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    };
 
-    // Should not throw
-    expect(() => saveSession(makeSession())).not.toThrow();
-    expect(warnSpy).toHaveBeenCalled();
-
-    spy.mockRestore();
-    warnSpy.mockRestore();
+    try {
+      // Should not throw — saveSession's try/catch must swallow.
+      expect(() => saveSession(makeSession())).not.toThrow();
+      // And it must have logged the failure.
+      expect(warnCount).toBeGreaterThan(0);
+    } finally {
+      localStorage.setItem = originalSetItem;
+      console.warn = originalWarn;
+    }
   });
 });
