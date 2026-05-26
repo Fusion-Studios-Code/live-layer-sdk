@@ -17,6 +17,27 @@ export type { TrackerConfig, VisitorInfo } from "./tracker";
 export { LiveKitSession } from "./livekit-session";
 export type { SessionCallbacks, SessionOptions, AgentConfig, TranscriptEntry, ConnectionState, AgentState } from "./livekit-session";
 
+// v0.8.0 — manifest API. Re-exported here so script-tag consumers
+// reach it via the global `LiveLayer` namespace AND ES-module
+// imports resolve directly. Auto-discovery runs on connect; consumers
+// only need this API for explicit overrides (`data-ll-field` is
+// enough for plain HTML, `registerFields([...])` is for SPA opt-in).
+export {
+  discover,
+  registerFields,
+  setFieldValue,
+  clearRegistry as clearFieldRegistry,
+  getRegisteredFields,
+  ManifestManager,
+} from "./manifest";
+export type {
+  FieldKind,
+  FieldOption,
+  FieldManifest,
+  ManifestPageContext,
+  DiscoveryEntry,
+} from "./manifest";
+
 // ─── Published Config shape (subset returned by /api/agents/{id}/config) ──
 
 interface PublishedAgentConfig {

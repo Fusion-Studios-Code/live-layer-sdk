@@ -22,6 +22,7 @@ import {
   RemoteParticipant,
   createLocalAudioTrack,
 } from "livekit-client";
+import { ManifestManager } from "./manifest/manager";
 
 // ─── Types ──────────────────────────────────────────────────────────
 
@@ -86,6 +87,25 @@ export interface SessionOptions {
    * Extra body fields to send with the session creation request.
    */
   sessionBody?: Record<string, unknown>;
+  /**
+   * v0.8.0 — automatic form-field manifest publishing. When `true`
+   * (default), the SDK scans the host page for `<input>` / `<select>` /
+   * `<textarea>` elements, builds a manifest, and publishes it to the
+   * agent via the `agent.context` participant attribute. The agent
+   * worker reads PageContext from that attribute, so the agent knows
+   * what's on the screen AND what the visitor has typed — no
+   * per-field `onChange` wiring required on the consumer side.
+   *
+   * Privacy guards are always on: password fields, credit-card
+   * autocomplete inputs, anything inside `.ll-widget`, and anything
+   * tagged `data-ll-private` are never published.
+   *
+   * Set to `false` for sites that want zero DOM observation
+   * (consumers who pass `data-ll-field` tags explicitly will still
+   * see those picked up — the attribute itself opts in even when
+   * automanifest is off).
+   */
+  automanifest?: boolean;
 }
 
 // ─── Constants ──────────────────────────────────────────────────────
@@ -112,6 +132,13 @@ export class LiveKitSession {
   private priorRoomName: string | null = null;
   /** Timestamp (ms since epoch) of the most recent successful connect. */
   private priorRoomConnectedAt = 0;
+  /**
+   * Manifest manager — populated on connect when automanifest is on.
+   * Scans the host DOM for form fields, attaches event-delegated
+   * change tracking, and publishes a PageContext to the agent via
+   * the `agent.context` participant attribute.
+   */
+  private manifestManager: ManifestManager | null = null;
 
   constructor(options: SessionOptions, callbacks: SessionCallbacks) {
     this.options = options;
@@ -250,6 +277,26 @@ export class LiveKitSession {
       this.callbacks.onConnectionStateChange("connected");
       this.callbacks.onAgentStateChange("listening");
 
+      // Manifest sync — discover the host page's form fields and
+      // publish them to the agent. Default-on; consumers can opt out
+      // via `automanifest: false`. Privacy guards (passwords, CC
+      // fields, .ll-widget descendants, data-ll-private) are always
+      // applied inside the discovery layer regardless.
+      if (this.options.automanifest !== false && typeof document !== "undefined") {
+        try {
+          this.manifestManager = new ManifestManager({
+            room: room as unknown as { localParticipant: { setAttributes(a: Record<string, string>): Promise<void> } },
+          });
+          this.manifestManager.start();
+        } catch (err) {
+          // Manifest is best-effort — a failure here must not break
+          // the session. Log and continue.
+          // eslint-disable-next-line no-console
+          console.warn("[LiveLayer] manifest manager failed to start:", err);
+          this.manifestManager = null;
+        }
+      }
+
       // Timeout: if no agent joins within 30s, disconnect
       this.agentTimeoutHandle = setTimeout(() => {
         if (room.remoteParticipants.size === 0) {
@@ -271,6 +318,10 @@ export class LiveKitSession {
     if (this.agentTimeoutHandle) {
       clearTimeout(this.agentTimeoutHandle);
       this.agentTimeoutHandle = null;
+    }
+    if (this.manifestManager) {
+      this.manifestManager.stop();
+      this.manifestManager = null;
     }
     if (this.room) {
       this.room.disconnect();
