@@ -49,6 +49,13 @@ export class ManifestTransport {
   private pending: ManifestPageContext | null = null;
   private destroyed = false;
   private encoder = new TextEncoder();
+  /** Serialized payload of the last SUCCESSFUL publish. Used to skip
+   * redundant setAttributes calls — the mutation watcher re-fires on the
+   * agent's own streaming widget DOM, which never changes a tracked field,
+   * so without this guard every cosmetic mutation spends a signal request
+   * (and spams "manifest publish failed" when the channel is busy). Only
+   * updated on success so a failed publish is retried next time. */
+  private lastPublished: string | null = null;
 
   constructor(opts: TransportOptions) {
     this.room = opts.room;
@@ -82,12 +89,15 @@ export class ManifestTransport {
     const ctx = this.pending;
     this.pending = null;
     const json = JSON.stringify(ctx);
+    // Skip the wire when nothing changed since the last successful publish.
+    if (json === this.lastPublished) return;
     const size = this.encoder.encode(json).byteLength;
     if (size > WARN_SIZE_BYTES) this.onOverflow(size);
     try {
       await this.room.localParticipant.setAttributes({
         [CONTEXT_ATTRIBUTE_KEY]: json,
       });
+      this.lastPublished = json;
     } catch (err) {
       // eslint-disable-next-line no-console
       console.warn("[LiveLayer] manifest publish failed:", err);
