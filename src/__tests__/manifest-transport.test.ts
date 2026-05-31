@@ -124,4 +124,43 @@ describe("ManifestTransport", () => {
     await expect(t.flush()).resolves.toBeUndefined();
     expect(room.localParticipant.setAttributes).toHaveBeenCalled();
   });
+
+  it("skips setAttributes when the serialized context is unchanged", async () => {
+    const room = makeRoom();
+    const t = new ManifestTransport({ room, debounceMs: 0 });
+    t.publish(buildPageContext(FIELDS));
+    await vi.runAllTimersAsync();
+    expect(room.localParticipant.setAttributes).toHaveBeenCalledTimes(1);
+    // A DOM mutation from the agent's own streaming UI re-triggers
+    // publish() with identical content — it must NOT hit the wire again.
+    t.publish(buildPageContext(FIELDS));
+    await vi.runAllTimersAsync();
+    expect(room.localParticipant.setAttributes).toHaveBeenCalledTimes(1);
+  });
+
+  it("re-publishes when the manifest content actually changes", async () => {
+    const room = makeRoom();
+    const t = new ManifestTransport({ room, debounceMs: 0 });
+    t.publish(buildPageContext([{ ...FIELDS[0], value: "a" }]));
+    await vi.runAllTimersAsync();
+    t.publish(buildPageContext([{ ...FIELDS[0], value: "b" }]));
+    await vi.runAllTimersAsync();
+    expect(room.localParticipant.setAttributes).toHaveBeenCalledTimes(2);
+  });
+
+  it("retries an unchanged publish after a failed setAttributes", async () => {
+    const setAttributes = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("timeout"))
+      .mockResolvedValue(undefined);
+    const room = { localParticipant: { setAttributes } };
+    const t = new ManifestTransport({ room, debounceMs: 0 });
+    t.publish(buildPageContext(FIELDS));
+    await vi.runAllTimersAsync(); // 1st attempt rejects
+    // Same content again: because the first publish failed, we must
+    // retry rather than treat it as already-published.
+    t.publish(buildPageContext(FIELDS));
+    await vi.runAllTimersAsync();
+    expect(setAttributes).toHaveBeenCalledTimes(2);
+  });
 });
