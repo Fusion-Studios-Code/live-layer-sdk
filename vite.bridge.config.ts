@@ -13,7 +13,7 @@ export default defineConfig({
     },
     outDir: "dist",
     emptyOutDir: false, // preserve widget.js + widget.mjs from the main build
-    minify: "esbuild",
+    minify: true,
     sourcemap: false,
     // Bridge is self-contained; no externals.
   },

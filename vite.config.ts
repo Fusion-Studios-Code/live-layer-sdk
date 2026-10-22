@@ -3,7 +3,7 @@ import dts from "vite-plugin-dts";
 
 export default defineConfig({
   plugins: [
-    dts({ rollupTypes: true }),
+    dts({ bundleTypes: true }),
   ],
   build: {
     lib: {
@@ -19,7 +19,7 @@ export default defineConfig({
     rollupOptions: {
       external: ["@fingerprintjs/fingerprintjs"],
     },
-    minify: "esbuild",
+    minify: true,
     sourcemap: false,
   },
   test: {
