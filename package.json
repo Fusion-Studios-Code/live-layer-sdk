@@ -29,7 +29,8 @@
     "build": "vite build && vite build --config vite.umd.config.ts && vite build --config vite.bridge.config.ts",
     "prepublishOnly": "npm run build",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "livekit-client": "^2.23.0"
