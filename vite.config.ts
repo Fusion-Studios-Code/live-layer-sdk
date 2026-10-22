@@ -1,3 +1,14 @@
+// Build config for the npm entry points: dist/widget.mjs (ES) and
+// dist/widget.cjs (CommonJS), plus the bundled dist/widget.d.ts.
+//
+// livekit-client is EXTERNAL here. It is a regular `dependency`, so
+// npm consumers already have it installed, and bundling it into these
+// files made every app that also imports livekit-client directly (e.g.
+// @livelayer/react) ship and parse two copies of it.
+//
+// The self-contained script-tag bundle (dist/widget.js, served as
+// v1.js) is built separately by vite.umd.config.ts, which still
+// bundles livekit-client.
 import { defineConfig } from "vite";
 import dts from "vite-plugin-dts";
 
@@ -9,15 +20,18 @@ export default defineConfig({
     lib: {
       entry: "src/widget.ts",
       name: "LiveLayer",
-      formats: ["umd", "es"],
-      fileName: (format) => format === "es" ? "widget.mjs" : "widget.js",
+      formats: ["es", "cjs"],
+      fileName: (format) => (format === "es" ? "widget.mjs" : "widget.cjs"),
     },
-    // livekit-client is bundled (not external) for zero-config script tag usage.
-    // This adds ~150KB gzipped but means users don't need to install it separately.
-    // @fingerprintjs/fingerprintjs is external — it's dynamically imported with
-    // a graceful fallback if not installed.
-    rollupOptions: {
-      external: ["@fingerprintjs/fingerprintjs"],
+    rolldownOptions: {
+      // @fingerprintjs/fingerprintjs is dynamically imported with a
+      // graceful fallback if it is not installed.
+      external: [/^livekit-client(\/|$)/, "@fingerprintjs/fingerprintjs"],
+      output: {
+        // Same shape the CommonJS branch of the UMD bundle had: named
+        // exports plus `default`.
+        exports: "named",
+      },
     },
     minify: true,
     sourcemap: false,
