@@ -8,19 +8,19 @@
  * Data flow:
  *   POST /api/widget/session → { token, url, agentConfig }
  *   → Room.connect(url, token)
- *   → publish local mic track
+ *   → publish local mic track (unless publishMicrophone: false)
  *   → subscribe to remote audio/video tracks
  *   → listen for transcription + agent state changes
  */
 
 import {
+  DisconnectReason,
   Room,
   RoomEvent,
   Track,
   RemoteTrack,
   RemoteTrackPublication,
   RemoteParticipant,
-  createLocalAudioTrack,
 } from "livekit-client";
 import { ManifestManager } from "./manifest/manager";
 
@@ -59,11 +59,31 @@ export interface SessionCallbacks {
    */
   onError: (message: string, code?: string) => void;
   /**
-   * Raw data channel messages. Called for ALL messages, including those
-   * already handled by onAgentStateChange (agent_state). Use for custom
-   * message types like avatar_active/avatar_idle, agent_action, etc.
+   * Raw data channel messages from the agent. Called for every JSON
+   * message the agent participant publishes without a topic, including
+   * those already handled by onAgentStateChange (agent_state). Use for
+   * custom message types like avatar_active/avatar_idle, agent commands,
+   * etc.
+   *
+   * Messages from any other participant (the avatar worker, other
+   * users) and messages on a topic never reach this callback, so they
+   * cannot drive agent commands.
    */
   onDataMessage?: (msg: Record<string, unknown>) => void;
+  /**
+   * Events the avatar worker publishes on the `lemonslice` data topic
+   * (`bot_ready`, `idle_timeout`, `error`, `metric`, ...). They are
+   * delivered here instead of onDataMessage: the avatar's own
+   * `idle_timeout` is not the agent ending the session.
+   *
+   * Only packets from the avatar participant (one that carries the
+   * `lk.publish_on_behalf` attribute) arrive here; the same topic from
+   * anyone else is dropped.
+   */
+  onAvatarEvent?: (
+    msg: Record<string, unknown>,
+    meta: { topic: string; participantIdentity: string },
+  ) => void;
   /**
    * Fires whenever the session's resume eligibility changes — e.g. after
    * a successful connect (eligible), after the 5-min window expires, or
@@ -71,6 +91,14 @@ export interface SessionCallbacks {
    * session" vs "Click to start" copy.
    */
   onResumabilityChange?: (canResume: boolean) => void;
+  /**
+   * The avatar worker (e.g. LemonSlice) left the room while the agent is
+   * still connected. The session stays up; its video track has already
+   * been removed (`onVideoTrackRemoved`), so this is the cue to show the
+   * still image instead of a frozen or empty video. `reason` is the
+   * LiveKit `DisconnectReason` name when the server reports one.
+   */
+  onAvatarDisconnected?: (info: { identity: string; reason?: string }) => void;
 }
 
 export interface SessionOptions {
@@ -106,6 +134,16 @@ export interface SessionOptions {
    * automanifest is off).
    */
   automanifest?: boolean;
+  /**
+   * Whether the session publishes the visitor's microphone after it
+   * connects (default `true`). Set `false` when the host owns the mic
+   * itself (e.g. @livelayer/react's uncontrolled mode, which publishes
+   * and gates its own track). Without it the room carries two
+   * Microphone-source tracks, and muting through
+   * `localParticipant.setMicrophoneEnabled(false)` only reaches one of
+   * them. With `false`, mic-permission errors are the host's to report.
+   */
+  publishMicrophone?: boolean;
 }
 
 // ─── Constants ──────────────────────────────────────────────────────
@@ -119,6 +157,65 @@ const AGENT_TIMEOUT_MS = 30_000;
  * cold start instead.
  */
 export const RESUME_WINDOW_MS = 5 * 60 * 1000;
+
+/**
+ * Participant attribute an avatar worker sets to the identity of the
+ * agent it publishes media for (LiveKit convention, see
+ * `ParticipantAgentAttributes.PublishOnBehalf` in components-js).
+ */
+const PUBLISH_ON_BEHALF_ATTR = "lk.publish_on_behalf";
+
+interface ParticipantLike {
+  identity: string;
+  isLocal?: boolean;
+  isAgent?: boolean;
+  attributes?: Readonly<Record<string, string>>;
+}
+
+/** An avatar worker: publishes video/audio on behalf of the agent. */
+function isAvatarParticipant(p: ParticipantLike | undefined): boolean {
+  return !!p && !p.isLocal && !!p.attributes?.[PUBLISH_ON_BEHALF_ATTR];
+}
+
+/**
+ * The agent itself: a remote AGENT-kind participant that is not an
+ * avatar worker (avatar workers are AGENT-kind too).
+ */
+function isAgentParticipant(p: ParticipantLike | undefined): boolean {
+  return !!p && !p.isLocal && !!p.isAgent && !isAvatarParticipant(p);
+}
+
+/** Data topic the LemonSlice avatar worker publishes its events on. */
+const AVATAR_DATA_TOPIC = "lemonslice";
+
+/**
+ * A data packet can arrive before the sender's ParticipantInfo: the
+ * packet comes over the data channel and the participant update over
+ * the signal connection, and the two are not ordered. livekit-client
+ * then emits DataReceived with no participant (only its identity), so
+ * the sender cannot be checked yet. Such packets are held for up to
+ * EARLY_PACKET_TTL_MS and replayed, in order, once the participant is
+ * known; whatever is still unresolved after that is dropped.
+ */
+const EARLY_PACKET_TTL_MS = 5_000;
+/** Upper bound on packets held across all unknown senders. */
+const MAX_EARLY_PACKETS = 64;
+
+function parseJsonObject(payload: Uint8Array): Record<string, unknown> | null {
+  try {
+    const parsed: unknown = JSON.parse(new TextDecoder().decode(payload));
+    return parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function disconnectReasonName(reason: DisconnectReason | undefined): string | undefined {
+  if (reason === undefined) return undefined;
+  return DisconnectReason[reason] ?? String(reason);
+}
 
 // ─── Session Class ──────────────────────────────────────────────────
 
@@ -139,6 +236,8 @@ export class LiveKitSession {
    * the `agent.context` participant attribute.
    */
   private manifestManager: ManifestManager | null = null;
+  /** Drops data packets held for not-yet-known senders (set per room). */
+  private _clearEarlyPackets: () => void = () => {};
 
   constructor(options: SessionOptions, callbacks: SessionCallbacks) {
     this.options = options;
@@ -253,25 +352,29 @@ export class LiveKitSession {
       // connection failure) so the UI can show the right copy + a retry
       // button that re-prompts. The LiveKit room is still open at this
       // point — disconnect explicitly so we don't leak an unused session.
-      try {
-        const micTrack = await createLocalAudioTrack({
-          echoCancellation: true,
-          noiseSuppression: true,
-        });
-        await room.localParticipant.publishTrack(micTrack);
-      } catch (micErr) {
-        const name = micErr instanceof Error ? micErr.name : "";
-        room.disconnect();
-        this.room = null;
-        if (name === "NotAllowedError" || name === "SecurityError") {
-          this.callbacks.onError("MIC_PERMISSION_DENIED");
-        } else if (name === "NotFoundError") {
-          this.callbacks.onError("MIC_NOT_FOUND");
-        } else {
-          this.callbacks.onError("MIC_UNAVAILABLE");
+      //
+      // setMicrophoneEnabled (not a hand-made track) so the publication
+      // is the room's one Microphone track: the room's
+      // audioCaptureDefaults apply, setMicrophoneEnabled(false) mutes
+      // exactly this track, and livekit-client's device recovery (e.g.
+      // restart on the OS default device) covers it.
+      if (this.options.publishMicrophone !== false) {
+        try {
+          await room.localParticipant.setMicrophoneEnabled(true);
+        } catch (micErr) {
+          const name = micErr instanceof Error ? micErr.name : "";
+          room.disconnect();
+          this.room = null;
+          if (name === "NotAllowedError" || name === "SecurityError") {
+            this.callbacks.onError("MIC_PERMISSION_DENIED");
+          } else if (name === "NotFoundError") {
+            this.callbacks.onError("MIC_NOT_FOUND");
+          } else {
+            this.callbacks.onError("MIC_UNAVAILABLE");
+          }
+          this.callbacks.onConnectionStateChange("error");
+          return;
         }
-        this.callbacks.onConnectionStateChange("error");
-        return;
       }
 
       this.callbacks.onConnectionStateChange("connected");
@@ -323,6 +426,7 @@ export class LiveKitSession {
       this.manifestManager.stop();
       this.manifestManager = null;
     }
+    this._clearEarlyPackets();
     if (this.room) {
       this.room.disconnect();
       this.room = null;
@@ -398,60 +502,149 @@ export class LiveKitSession {
       }
     });
 
-    // Data messages from agent
-    room.on(RoomEvent.DataReceived, (payload: Uint8Array) => {
-      try {
-        const msg = JSON.parse(new TextDecoder().decode(payload));
-        // Forward all parsed messages to generic handler
-        this.callbacks.onDataMessage?.(msg);
-        // Handle agent_state internally
-        if (msg.type === "agent_state") {
-          const state = msg.state;
-          if (["speaking", "listening", "thinking", "idle"].includes(state)) {
-            this.callbacks.onAgentStateChange(state as AgentState);
-          }
+    // Data messages. Ours come from the agent participant with NO topic.
+    // The LemonSlice avatar worker publishes its own events on the
+    // `lemonslice` topic (including its own `idle_timeout`); those go to
+    // onAvatarEvent, only when the avatar sent them, and never reach the
+    // agent-command path. Anything else (another topic, a sender that
+    // is not the agent) is dropped: whatever reaches onDataMessage can
+    // navigate, scroll, click and fill forms on the host page.
+    const warnedSenders = new Set<string>();
+    const warnIgnored = (
+      identity: string,
+      topic: string | undefined,
+      msg: Record<string, unknown>,
+      why: string,
+    ) => {
+      // Once per sender per room: a participant that publishes at a
+      // steady rate (metrics, heartbeats) must not flood the console.
+      if (warnedSenders.has(identity)) return;
+      warnedSenders.add(identity);
+      console.warn(
+        `[LiveLayer] Ignoring data messages ${why}; further messages from this sender are dropped silently`,
+        { from: identity, topic, type: msg.type },
+      );
+    };
+
+    const route = (
+      msg: Record<string, unknown>,
+      sender: RemoteParticipant,
+      topic: string | undefined,
+    ) => {
+      if (topic === AVATAR_DATA_TOPIC) {
+        if (!isAvatarParticipant(sender)) {
+          warnIgnored(sender.identity, topic, msg, "on the avatar topic from a non-avatar sender");
+          return;
         }
-        // Handle agent_caption — the agent worker streams these on
-        // each text chunk from the LLM via a custom TextOutput sink.
-        // Same `id` across chunks of one turn so the entry updates in
-        // place; `final: false` while streaming, `final: true` when
-        // the segment closes. Bypasses LiveKit's built-in
-        // publishTranscription path because LemonSlice's audio
-        // interception leaves the agent without a track sid (which
-        // rtc-node requires).
-        if (
-          msg.type === "agent_caption" &&
-          typeof msg.text === "string" &&
-          msg.text.length > 0
-        ) {
-          const id =
-            typeof msg.id === "string" && msg.id
-              ? msg.id
-              : `LL_AGENT_${Date.now()}`;
-          // `final` defaults to true for backward compatibility with
-          // pre-streaming agent builds that emitted one caption per turn.
-          const isFinal = msg.final !== false;
-          const idx = this.transcript.findIndex((t) => t.id === id);
-          const entry: TranscriptEntry = {
-            id,
-            role: "agent",
-            text: msg.text,
-            final: isFinal,
-          };
-          if (idx >= 0) {
-            this.transcript[idx] = entry;
-          } else {
-            this.transcript.push(entry);
-          }
-          this.callbacks.onTranscript([...this.transcript]);
-        }
-      } catch {
-        // Ignore non-JSON
+        this._safely(() =>
+          this.callbacks.onAvatarEvent?.(msg, { topic, participantIdentity: sender.identity }),
+        );
+        return;
       }
+      if (!isAgentParticipant(sender)) {
+        warnIgnored(sender.identity, topic, msg, "that did not come from the agent");
+        return;
+      }
+      this._safely(() => this._handleAgentMessage(msg));
+    };
+
+    // Packets whose sender livekit-client does not know yet, by identity.
+    type HeldPacket = { msg: Record<string, unknown>; topic?: string };
+    const early = new Map<string, { packets: HeldPacket[]; timer: ReturnType<typeof setTimeout> }>();
+    let earlyCount = 0;
+
+    /**
+     * Replay the packets held for `identity` if the participant is now
+     * known. With `expire`, also give up on a sender that never showed.
+     */
+    const flushEarly = (identity: string, expire = false) => {
+      const held = early.get(identity);
+      if (!held) return;
+      const sender = room.remoteParticipants.get(identity);
+      if (!sender && !expire) return;
+      early.delete(identity);
+      clearTimeout(held.timer);
+      earlyCount -= held.packets.length;
+      if (!sender) {
+        const first = held.packets[0];
+        warnIgnored(identity, first?.topic, first?.msg ?? {}, "from a participant that never joined");
+        return;
+      }
+      for (const p of held.packets) route(p.msg, sender, p.topic);
+    };
+
+    const holdEarly = (
+      identity: string,
+      msg: Record<string, unknown>,
+      topic: string | undefined,
+    ) => {
+      if (earlyCount >= MAX_EARLY_PACKETS) {
+        warnIgnored(identity, topic, msg, "from an unknown participant (too many held)");
+        return;
+      }
+      let held = early.get(identity);
+      if (!held) {
+        held = {
+          packets: [],
+          timer: setTimeout(() => flushEarly(identity, true), EARLY_PACKET_TTL_MS),
+        };
+        early.set(identity, held);
+      }
+      held.packets.push({ msg, topic });
+      earlyCount += 1;
+    };
+
+    const clearEarly = () => {
+      for (const held of early.values()) clearTimeout(held.timer);
+      early.clear();
+      earlyCount = 0;
+    };
+    this._clearEarlyPackets = clearEarly;
+
+    room.on(
+      RoomEvent.DataReceived,
+      (
+        payload: Uint8Array,
+        participant?: RemoteParticipant,
+        _kind?: unknown,
+        topic?: string,
+        _encryptionType?: unknown,
+        participantIdentity?: string,
+      ) => {
+        if (topic && topic !== AVATAR_DATA_TOPIC) return; // Not ours.
+        const msg = parseJsonObject(payload);
+        if (!msg) return; // Ignore non-JSON
+
+        if (!participant) {
+          if (participantIdentity) {
+            holdEarly(participantIdentity, msg, topic);
+          } else {
+            warnIgnored("(unknown)", topic, msg, "without a sender");
+          }
+          return;
+        }
+
+        // Anything held from this sender goes first, to keep order.
+        flushEarly(participant.identity);
+        route(msg, participant, topic);
+      },
+    );
+
+    // The common case for held packets: the participant update lands
+    // right after the packet.
+    room.on(RoomEvent.ParticipantConnected, (participant: RemoteParticipant) => {
+      flushEarly(participant.identity);
+    });
+    // livekit-client does not emit ParticipantConnected for participants
+    // it learns about while the room is still connecting; check those
+    // once the room is up.
+    room.on(RoomEvent.Connected, () => {
+      for (const identity of [...early.keys()]) flushEarly(identity);
     });
 
     // Disconnected
     room.on(RoomEvent.Disconnected, () => {
+      clearEarly();
       this.callbacks.onConnectionStateChange("disconnected");
       this.callbacks.onAgentStateChange("idle");
       this.room = null;
@@ -470,9 +663,104 @@ export class LiveKitSession {
     // room down on our side too. RoomEvent.Disconnected then fires
     // and runs the cleanup above. canResume stays true (set on
     // connect, never reset) so the user sees the resume CTA.
-    room.on(RoomEvent.ParticipantDisconnected, (participant) => {
-      if (participant.isLocal) return;
-      this.room?.disconnect();
-    });
+    //
+    // Only the AGENT leaving ends the session. The avatar worker
+    // (LemonSlice) is a separate participant; when it leaves (crash,
+    // its own idle timeout, video failure) the agent is still there and
+    // can carry on voice-only, so we keep the session and tell the host
+    // to show the still image. Any other participant leaving is not our
+    // concern either.
+    room.on(
+      RoomEvent.ParticipantDisconnected,
+      (participant: RemoteParticipant, reason?: DisconnectReason) => {
+        if (participant.isLocal) return;
+        const reasonName = disconnectReasonName(reason);
+        if (isAvatarParticipant(participant)) {
+          console.info("[LiveLayer] Avatar left the room; keeping the session", {
+            identity: participant.identity,
+            reason: reasonName,
+          });
+          this.callbacks.onAvatarDisconnected?.({
+            identity: participant.identity,
+            reason: reasonName,
+          });
+          return;
+        }
+        if (!isAgentParticipant(participant)) {
+          console.info("[LiveLayer] Non-agent participant left the room", {
+            identity: participant.identity,
+            reason: reasonName,
+          });
+          return;
+        }
+        console.info("[LiveLayer] Agent left the room; ending the session", {
+          identity: participant.identity,
+          reason: reasonName,
+        });
+        this.room?.disconnect();
+      },
+    );
+  }
+
+  /**
+   * Run a data-message handler without letting a throwing host callback
+   * escape into livekit-client's event emitter.
+   */
+  private _safely(fn: () => void): void {
+    try {
+      fn();
+    } catch (err) {
+      console.error("[LiveLayer] Data message handler failed:", err);
+    }
+  }
+
+  /** A JSON message the agent participant published without a topic. */
+  private _handleAgentMessage(msg: Record<string, unknown>): void {
+    // Forward all agent messages to the generic handler
+    this.callbacks.onDataMessage?.(msg);
+    // Handle agent_state internally
+    if (msg.type === "agent_state") {
+      const state = msg.state;
+      if (
+        typeof state === "string" &&
+        ["speaking", "listening", "thinking", "idle"].includes(state)
+      ) {
+        this.callbacks.onAgentStateChange(state as AgentState);
+      }
+    }
+    // Handle agent_caption — the agent worker streams these on
+    // each text chunk from the LLM via a custom TextOutput sink.
+    // Same `id` across chunks of one turn so the entry updates in
+    // place; `final: false` while streaming, `final: true` when
+    // the segment closes. Bypasses LiveKit's built-in
+    // publishTranscription path because LemonSlice's audio
+    // interception leaves the agent without a track sid (which
+    // rtc-node requires).
+    if (
+      msg.type === "agent_caption" &&
+      typeof msg.text === "string" &&
+      msg.text.length > 0
+    ) {
+      const id =
+        typeof msg.id === "string" && msg.id
+          ? msg.id
+          : `LL_AGENT_${Date.now()}`;
+      // `final` defaults to true for backward compatibility with
+      // pre-streaming agent builds that emitted one caption per turn.
+      const isFinal = msg.final !== false;
+      const idx = this.transcript.findIndex((t) => t.id === id);
+      const entry: TranscriptEntry = {
+        id,
+        role: "agent",
+        text: msg.text,
+        final: isFinal,
+      };
+      if (idx >= 0) {
+        this.transcript[idx] = entry;
+      } else {
+        this.transcript.push(entry);
+      }
+      this.callbacks.onTranscript([...this.transcript]);
+    }
   }
 }

@@ -31,6 +31,57 @@ widget.setAttribute("agent-id", "your_agent_id");
 document.body.appendChild(widget);
 ```
 
+### Module formats
+
+| Entry | File | livekit-client |
+| --- | --- | --- |
+| `<script src>`, unpkg / jsDelivr default, `v1.js` | `dist/widget.js` (UMD) | bundled |
+| `import "@livelayer/sdk"` | `dist/widget.mjs` (ES) | imported from the `livekit-client` package |
+| `require("@livelayer/sdk")` | `dist/widget.cjs` (CommonJS) | required from the `livekit-client` package |
+
+Since 0.9.0 the ES and CommonJS builds no longer bundle livekit-client. It is a regular dependency, so npm, bundlers and Node resolve it for you, and an app that also imports livekit-client ships one copy instead of two. If your app depends on livekit-client directly, use `^2.23.0` so it resolves to the same copy as the SDK.
+
+Loading `dist/widget.mjs` straight from a CDN URL in the browser, with no bundler, now needs an import map entry for `livekit-client` (or a CDN that rewrites bare imports). Without a bundler, use the script tag above, which is unchanged.
+
+### Headless session (`LiveKitSession`)
+
+`LiveKitSession` is the connection layer under `<livelayer-widget>`, for hosts that render their own UI (e.g. `@livelayer/react`).
+
+```ts
+import { LiveKitSession } from "@livelayer/sdk";
+
+const session = new LiveKitSession(
+  {
+    agentId: "your_agent_id",
+    baseUrl: "https://app.livelayer.studio",
+    apiKey: "ll_abc...",
+    publishMicrophone: true, // default; see below
+  },
+  {
+    onConnectionStateChange: (state) => {},
+    onAgentStateChange: (state) => {},
+    onTranscript: (entries) => {},
+    onAgentConfig: (config) => {},
+    onAudioTrack: (audioEl) => {},
+    onVideoTrack: (videoEl) => {},
+    onVideoTrackRemoved: () => {},
+    onError: (message, code) => {},
+    onDataMessage: (msg) => {},            // agent commands and state
+    onAvatarEvent: (msg, meta) => {},      // optional, 0.9.0
+    onAvatarDisconnected: (info) => {},    // optional, 0.9.0
+  },
+);
+await session.connect();
+```
+
+Options and callbacks added in 0.9.0, all optional:
+
+- **`publishMicrophone`** (option, default `true`). Whether the session turns on the visitor's mic after connecting, through `localParticipant.setMicrophoneEnabled(true)`. Set `false` when the host publishes and gates the mic itself; otherwise the room carries two microphone tracks and `setMicrophoneEnabled(false)` mutes only one of them. With `false`, mic permission errors (`MIC_PERMISSION_DENIED`, `MIC_NOT_FOUND`, `MIC_UNAVAILABLE`) are the host's to report.
+- **`onAvatarEvent(msg, { topic, participantIdentity })`**. Events the avatar worker (LemonSlice) publishes on the `lemonslice` data topic, such as `bot_ready`, `idle_timeout` or `error`. Only packets from the avatar participant arrive here, and none of them reach `onDataMessage`: the avatar's own `idle_timeout` does not end the session.
+- **`onAvatarDisconnected({ identity, reason })`**. The avatar left the room while the agent is still connected. The session stays up (voice only), and `onVideoTrackRemoved` has already fired, so this is the cue to show the still image. `reason` is the LiveKit `DisconnectReason` name when the server sends one.
+
+Which data messages reach `onDataMessage`: JSON objects published **without a topic** by **the agent participant** (an agent-kind participant without the `lk.publish_on_behalf` attribute). Everything else is dropped, because whatever reaches `onDataMessage` can navigate, scroll, click and fill forms. A packet that arrives before livekit-client knows its sender is held for up to 5 seconds and checked once the sender is known. The session ends when the agent leaves, not when the avatar or another participant leaves.
+
 ### Structured data collection (0.7.0 — unified API)
 
 **Just write regular HTML forms.** The widget auto-discovers every `<form>` on the page, paints values into the matching `[name="..."]` inputs as the agent records them, and fires one `ll-collected` event when the run is done:
@@ -142,6 +193,7 @@ If the key is compromised or you rotate credentials, revoke it from the same das
 ### Classes
 
 - **`LiveLayerWidget`** -- The `<livelayer-widget>` custom element class.
+- **`LiveKitSession`** -- Headless connection layer (see [Headless session](#headless-session-livekitsession)).
 - **`LiveLayerTracker`** -- Visitor tracking with fingerprinting and event batching.
 
 ### Functions

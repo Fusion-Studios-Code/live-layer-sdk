@@ -13,8 +13,15 @@ export default defineConfig({
     },
     outDir: "dist",
     emptyOutDir: false, // preserve widget.js + widget.mjs from the main build
-    minify: "esbuild",
+    minify: true,
     sourcemap: false,
     // Bridge is self-contained; no externals.
+    rolldownOptions: {
+      output: {
+        // Classic <script> on customer pages: keep the "use strict"
+        // Rollup emitted by default (Rolldown's default omits it).
+        strict: true,
+      },
+    },
   },
 });
