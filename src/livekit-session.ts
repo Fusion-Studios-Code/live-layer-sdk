@@ -14,6 +14,7 @@
  */
 
 import {
+  DisconnectReason,
   Room,
   RoomEvent,
   Track,
@@ -71,6 +72,14 @@ export interface SessionCallbacks {
    * session" vs "Click to start" copy.
    */
   onResumabilityChange?: (canResume: boolean) => void;
+  /**
+   * The avatar worker (e.g. LemonSlice) left the room while the agent is
+   * still connected. The session stays up; its video track has already
+   * been removed (`onVideoTrackRemoved`), so this is the cue to show the
+   * still image instead of a frozen or empty video. `reason` is the
+   * LiveKit `DisconnectReason` name when the server reports one.
+   */
+  onAvatarDisconnected?: (info: { identity: string; reason?: string }) => void;
 }
 
 export interface SessionOptions {
@@ -119,6 +128,38 @@ const AGENT_TIMEOUT_MS = 30_000;
  * cold start instead.
  */
 export const RESUME_WINDOW_MS = 5 * 60 * 1000;
+
+/**
+ * Participant attribute an avatar worker sets to the identity of the
+ * agent it publishes media for (LiveKit convention, see
+ * `ParticipantAgentAttributes.PublishOnBehalf` in components-js).
+ */
+const PUBLISH_ON_BEHALF_ATTR = "lk.publish_on_behalf";
+
+interface ParticipantLike {
+  identity: string;
+  isLocal?: boolean;
+  isAgent?: boolean;
+  attributes?: Readonly<Record<string, string>>;
+}
+
+/** An avatar worker: publishes video/audio on behalf of the agent. */
+function isAvatarParticipant(p: ParticipantLike | undefined): boolean {
+  return !!p && !p.isLocal && !!p.attributes?.[PUBLISH_ON_BEHALF_ATTR];
+}
+
+/**
+ * The agent itself: a remote AGENT-kind participant that is not an
+ * avatar worker (avatar workers are AGENT-kind too).
+ */
+function isAgentParticipant(p: ParticipantLike | undefined): boolean {
+  return !!p && !p.isLocal && !!p.isAgent && !isAvatarParticipant(p);
+}
+
+function disconnectReasonName(reason: DisconnectReason | undefined): string | undefined {
+  if (reason === undefined) return undefined;
+  return DisconnectReason[reason] ?? String(reason);
+}
 
 // ─── Session Class ──────────────────────────────────────────────────
 
@@ -470,9 +511,42 @@ export class LiveKitSession {
     // room down on our side too. RoomEvent.Disconnected then fires
     // and runs the cleanup above. canResume stays true (set on
     // connect, never reset) so the user sees the resume CTA.
-    room.on(RoomEvent.ParticipantDisconnected, (participant) => {
-      if (participant.isLocal) return;
-      this.room?.disconnect();
-    });
+    //
+    // Only the AGENT leaving ends the session. The avatar worker
+    // (LemonSlice) is a separate participant; when it leaves (crash,
+    // its own idle timeout, video failure) the agent is still there and
+    // can carry on voice-only, so we keep the session and tell the host
+    // to show the still image. Any other participant leaving is not our
+    // concern either.
+    room.on(
+      RoomEvent.ParticipantDisconnected,
+      (participant: RemoteParticipant, reason?: DisconnectReason) => {
+        if (participant.isLocal) return;
+        const reasonName = disconnectReasonName(reason);
+        if (isAvatarParticipant(participant)) {
+          console.info("[LiveLayer] Avatar left the room; keeping the session", {
+            identity: participant.identity,
+            reason: reasonName,
+          });
+          this.callbacks.onAvatarDisconnected?.({
+            identity: participant.identity,
+            reason: reasonName,
+          });
+          return;
+        }
+        if (!isAgentParticipant(participant)) {
+          console.info("[LiveLayer] Non-agent participant left the room", {
+            identity: participant.identity,
+            reason: reasonName,
+          });
+          return;
+        }
+        console.info("[LiveLayer] Agent left the room; ending the session", {
+          identity: participant.identity,
+          reason: reasonName,
+        });
+        this.room?.disconnect();
+      },
+    );
   }
 }
