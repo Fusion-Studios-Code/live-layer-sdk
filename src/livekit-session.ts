@@ -60,11 +60,27 @@ export interface SessionCallbacks {
    */
   onError: (message: string, code?: string) => void;
   /**
-   * Raw data channel messages. Called for ALL messages, including those
-   * already handled by onAgentStateChange (agent_state). Use for custom
-   * message types like avatar_active/avatar_idle, agent_action, etc.
+   * Raw data channel messages from the agent. Called for every JSON
+   * message the agent participant publishes without a topic, including
+   * those already handled by onAgentStateChange (agent_state). Use for
+   * custom message types like avatar_active/avatar_idle, agent commands,
+   * etc.
+   *
+   * Messages from any other participant (the avatar worker, other
+   * users) and messages on a topic never reach this callback, so they
+   * cannot drive agent commands.
    */
   onDataMessage?: (msg: Record<string, unknown>) => void;
+  /**
+   * Events the avatar worker publishes on the `lemonslice` data topic
+   * (`bot_ready`, `idle_timeout`, `error`, `metric`, ...). They are
+   * delivered here instead of onDataMessage: the avatar's own
+   * `idle_timeout` is not the agent ending the session.
+   */
+  onAvatarEvent?: (
+    msg: Record<string, unknown>,
+    meta: { topic: string; participantIdentity?: string },
+  ) => void;
   /**
    * Fires whenever the session's resume eligibility changes — e.g. after
    * a successful connect (eligible), after the 5-min window expires, or
@@ -154,6 +170,20 @@ function isAvatarParticipant(p: ParticipantLike | undefined): boolean {
  */
 function isAgentParticipant(p: ParticipantLike | undefined): boolean {
   return !!p && !p.isLocal && !!p.isAgent && !isAvatarParticipant(p);
+}
+
+/** Data topic the LemonSlice avatar worker publishes its events on. */
+const AVATAR_DATA_TOPIC = "lemonslice";
+
+function parseJsonObject(payload: Uint8Array): Record<string, unknown> | null {
+  try {
+    const parsed: unknown = JSON.parse(new TextDecoder().decode(payload));
+    return parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : null;
+  } catch {
+    return null;
+  }
 }
 
 function disconnectReasonName(reason: DisconnectReason | undefined): string | undefined {
@@ -439,57 +469,52 @@ export class LiveKitSession {
       }
     });
 
-    // Data messages from agent
-    room.on(RoomEvent.DataReceived, (payload: Uint8Array) => {
-      try {
-        const msg = JSON.parse(new TextDecoder().decode(payload));
-        // Forward all parsed messages to generic handler
-        this.callbacks.onDataMessage?.(msg);
-        // Handle agent_state internally
-        if (msg.type === "agent_state") {
-          const state = msg.state;
-          if (["speaking", "listening", "thinking", "idle"].includes(state)) {
-            this.callbacks.onAgentStateChange(state as AgentState);
-          }
+    // Data messages. Ours come from the agent participant with NO topic.
+    // The LemonSlice avatar worker publishes its own events on the
+    // `lemonslice` topic (including its own `idle_timeout`), which go to
+    // onAvatarEvent and never reach the agent-command path. Anything
+    // else (another topic, a non-agent sender) is dropped: whatever
+    // reaches onDataMessage can navigate, scroll, click and fill forms
+    // on the host page.
+    room.on(
+      RoomEvent.DataReceived,
+      (
+        payload: Uint8Array,
+        participant?: RemoteParticipant,
+        _kind?: unknown,
+        topic?: string,
+        _encryptionType?: unknown,
+        participantIdentity?: string,
+      ) => {
+        const msg = parseJsonObject(payload);
+        if (!msg) return; // Ignore non-JSON
+
+        const senderIdentity = participant?.identity ?? participantIdentity;
+
+        if (topic === AVATAR_DATA_TOPIC) {
+          this._safely(() =>
+            this.callbacks.onAvatarEvent?.(msg, { topic, participantIdentity: senderIdentity }),
+          );
+          return;
         }
-        // Handle agent_caption — the agent worker streams these on
-        // each text chunk from the LLM via a custom TextOutput sink.
-        // Same `id` across chunks of one turn so the entry updates in
-        // place; `final: false` while streaming, `final: true` when
-        // the segment closes. Bypasses LiveKit's built-in
-        // publishTranscription path because LemonSlice's audio
-        // interception leaves the agent without a track sid (which
-        // rtc-node requires).
-        if (
-          msg.type === "agent_caption" &&
-          typeof msg.text === "string" &&
-          msg.text.length > 0
-        ) {
-          const id =
-            typeof msg.id === "string" && msg.id
-              ? msg.id
-              : `LL_AGENT_${Date.now()}`;
-          // `final` defaults to true for backward compatibility with
-          // pre-streaming agent builds that emitted one caption per turn.
-          const isFinal = msg.final !== false;
-          const idx = this.transcript.findIndex((t) => t.id === id);
-          const entry: TranscriptEntry = {
-            id,
-            role: "agent",
-            text: msg.text,
-            final: isFinal,
-          };
-          if (idx >= 0) {
-            this.transcript[idx] = entry;
-          } else {
-            this.transcript.push(entry);
-          }
-          this.callbacks.onTranscript([...this.transcript]);
+        if (topic) return; // Not ours.
+
+        // livekit-client leaves `participant` undefined when the packet
+        // beats the participant's join; resolve it by identity.
+        const sender =
+          participant ??
+          (participantIdentity ? room.remoteParticipants.get(participantIdentity) : undefined);
+        if (!isAgentParticipant(sender)) {
+          console.warn("[LiveLayer] Ignoring a data message that did not come from the agent", {
+            from: senderIdentity,
+            type: msg.type,
+          });
+          return;
         }
-      } catch {
-        // Ignore non-JSON
-      }
-    });
+
+        this._safely(() => this._handleAgentMessage(msg));
+      },
+    );
 
     // Disconnected
     room.on(RoomEvent.Disconnected, () => {
@@ -548,5 +573,67 @@ export class LiveKitSession {
         this.room?.disconnect();
       },
     );
+  }
+
+  /**
+   * Run a data-message handler without letting a throwing host callback
+   * escape into livekit-client's event emitter.
+   */
+  private _safely(fn: () => void): void {
+    try {
+      fn();
+    } catch (err) {
+      console.error("[LiveLayer] Data message handler failed:", err);
+    }
+  }
+
+  /** A JSON message the agent participant published without a topic. */
+  private _handleAgentMessage(msg: Record<string, unknown>): void {
+    // Forward all agent messages to the generic handler
+    this.callbacks.onDataMessage?.(msg);
+    // Handle agent_state internally
+    if (msg.type === "agent_state") {
+      const state = msg.state;
+      if (
+        typeof state === "string" &&
+        ["speaking", "listening", "thinking", "idle"].includes(state)
+      ) {
+        this.callbacks.onAgentStateChange(state as AgentState);
+      }
+    }
+    // Handle agent_caption — the agent worker streams these on
+    // each text chunk from the LLM via a custom TextOutput sink.
+    // Same `id` across chunks of one turn so the entry updates in
+    // place; `final: false` while streaming, `final: true` when
+    // the segment closes. Bypasses LiveKit's built-in
+    // publishTranscription path because LemonSlice's audio
+    // interception leaves the agent without a track sid (which
+    // rtc-node requires).
+    if (
+      msg.type === "agent_caption" &&
+      typeof msg.text === "string" &&
+      msg.text.length > 0
+    ) {
+      const id =
+        typeof msg.id === "string" && msg.id
+          ? msg.id
+          : `LL_AGENT_${Date.now()}`;
+      // `final` defaults to true for backward compatibility with
+      // pre-streaming agent builds that emitted one caption per turn.
+      const isFinal = msg.final !== false;
+      const idx = this.transcript.findIndex((t) => t.id === id);
+      const entry: TranscriptEntry = {
+        id,
+        role: "agent",
+        text: msg.text,
+        final: isFinal,
+      };
+      if (idx >= 0) {
+        this.transcript[idx] = entry;
+      } else {
+        this.transcript.push(entry);
+      }
+      this.callbacks.onTranscript([...this.transcript]);
+    }
   }
 }
