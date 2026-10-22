@@ -24,6 +24,10 @@ export default defineConfig({
       output: {
         // Global `LiveLayer` exposes the named exports plus `default`.
         exports: "named",
+        // Keep the "use strict" that Rollup emitted by default (see
+        // vite.config.ts). v1.js runs as a classic <script> on customer
+        // sites, so without it the whole bundle would run in sloppy mode.
+        strict: true,
       },
     },
     minify: true,

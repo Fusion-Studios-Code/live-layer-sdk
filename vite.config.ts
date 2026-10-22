@@ -31,6 +31,11 @@ export default defineConfig({
         // Same shape the CommonJS branch of the UMD bundle had: named
         // exports plus `default`.
         exports: "named",
+        // Rollup put "use strict" at the top of every non-ES output by
+        // default; Rolldown's default ('auto') only keeps directives
+        // that are in the source, and ours has none. Without this,
+        // widget.cjs runs in sloppy mode.
+        strict: true,
       },
     },
     minify: true,

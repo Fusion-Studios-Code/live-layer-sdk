@@ -31,6 +31,12 @@ jobs:
           test -f dist/widget.cjs  || (echo "Missing dist/widget.cjs"  && exit 1)
           test -f dist/widget.d.ts || (echo "Missing dist/widget.d.ts" && exit 1)
           test -f dist/bridge.js   || (echo "Missing dist/bridge.js"   && exit 1)
+          # The script-tag and CommonJS outputs must run in strict mode,
+          # as they did with Rollup. Rolldown only emits the directive
+          # when output.strict is true, and puts it at the top of the file.
+          for f in dist/widget.js dist/widget.cjs dist/bridge.js; do
+            [ "$(head -c 13 "$f")" = '"use strict";' ] || (echo "$f does not start with \"use strict\";" && exit 1)
+          done
 
       - name: Upload dist artifact
         if: startsWith(github.ref, 'refs/tags/v')
