@@ -8,7 +8,7 @@
  * Data flow:
  *   POST /api/widget/session → { token, url, agentConfig }
  *   → Room.connect(url, token)
- *   → publish local mic track
+ *   → publish local mic track (unless publishMicrophone: false)
  *   → subscribe to remote audio/video tracks
  *   → listen for transcription + agent state changes
  */
@@ -21,7 +21,6 @@ import {
   RemoteTrack,
   RemoteTrackPublication,
   RemoteParticipant,
-  createLocalAudioTrack,
 } from "livekit-client";
 import { ManifestManager } from "./manifest/manager";
 
@@ -131,6 +130,16 @@ export interface SessionOptions {
    * automanifest is off).
    */
   automanifest?: boolean;
+  /**
+   * Whether the session publishes the visitor's microphone after it
+   * connects (default `true`). Set `false` when the host owns the mic
+   * itself (e.g. @livelayer/react's uncontrolled mode, which publishes
+   * and gates its own track). Without it the room carries two
+   * Microphone-source tracks, and muting through
+   * `localParticipant.setMicrophoneEnabled(false)` only reaches one of
+   * them. With `false`, mic-permission errors are the host's to report.
+   */
+  publishMicrophone?: boolean;
 }
 
 // ─── Constants ──────────────────────────────────────────────────────
@@ -324,25 +333,29 @@ export class LiveKitSession {
       // connection failure) so the UI can show the right copy + a retry
       // button that re-prompts. The LiveKit room is still open at this
       // point — disconnect explicitly so we don't leak an unused session.
-      try {
-        const micTrack = await createLocalAudioTrack({
-          echoCancellation: true,
-          noiseSuppression: true,
-        });
-        await room.localParticipant.publishTrack(micTrack);
-      } catch (micErr) {
-        const name = micErr instanceof Error ? micErr.name : "";
-        room.disconnect();
-        this.room = null;
-        if (name === "NotAllowedError" || name === "SecurityError") {
-          this.callbacks.onError("MIC_PERMISSION_DENIED");
-        } else if (name === "NotFoundError") {
-          this.callbacks.onError("MIC_NOT_FOUND");
-        } else {
-          this.callbacks.onError("MIC_UNAVAILABLE");
+      //
+      // setMicrophoneEnabled (not a hand-made track) so the publication
+      // is the room's one Microphone track: the room's
+      // audioCaptureDefaults apply, setMicrophoneEnabled(false) mutes
+      // exactly this track, and livekit-client's device recovery (e.g.
+      // restart on the OS default device) covers it.
+      if (this.options.publishMicrophone !== false) {
+        try {
+          await room.localParticipant.setMicrophoneEnabled(true);
+        } catch (micErr) {
+          const name = micErr instanceof Error ? micErr.name : "";
+          room.disconnect();
+          this.room = null;
+          if (name === "NotAllowedError" || name === "SecurityError") {
+            this.callbacks.onError("MIC_PERMISSION_DENIED");
+          } else if (name === "NotFoundError") {
+            this.callbacks.onError("MIC_NOT_FOUND");
+          } else {
+            this.callbacks.onError("MIC_UNAVAILABLE");
+          }
+          this.callbacks.onConnectionStateChange("error");
+          return;
         }
-        this.callbacks.onConnectionStateChange("error");
-        return;
       }
 
       this.callbacks.onConnectionStateChange("connected");
