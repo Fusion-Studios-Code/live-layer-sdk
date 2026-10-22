@@ -75,10 +75,14 @@ export interface SessionCallbacks {
    * (`bot_ready`, `idle_timeout`, `error`, `metric`, ...). They are
    * delivered here instead of onDataMessage: the avatar's own
    * `idle_timeout` is not the agent ending the session.
+   *
+   * Only packets from the avatar participant (one that carries the
+   * `lk.publish_on_behalf` attribute) arrive here; the same topic from
+   * anyone else is dropped.
    */
   onAvatarEvent?: (
     msg: Record<string, unknown>,
-    meta: { topic: string; participantIdentity?: string },
+    meta: { topic: string; participantIdentity: string },
   ) => void;
   /**
    * Fires whenever the session's resume eligibility changes — e.g. after
@@ -184,6 +188,19 @@ function isAgentParticipant(p: ParticipantLike | undefined): boolean {
 /** Data topic the LemonSlice avatar worker publishes its events on. */
 const AVATAR_DATA_TOPIC = "lemonslice";
 
+/**
+ * A data packet can arrive before the sender's ParticipantInfo: the
+ * packet comes over the data channel and the participant update over
+ * the signal connection, and the two are not ordered. livekit-client
+ * then emits DataReceived with no participant (only its identity), so
+ * the sender cannot be checked yet. Such packets are held for up to
+ * EARLY_PACKET_TTL_MS and replayed, in order, once the participant is
+ * known; whatever is still unresolved after that is dropped.
+ */
+const EARLY_PACKET_TTL_MS = 5_000;
+/** Upper bound on packets held across all unknown senders. */
+const MAX_EARLY_PACKETS = 64;
+
 function parseJsonObject(payload: Uint8Array): Record<string, unknown> | null {
   try {
     const parsed: unknown = JSON.parse(new TextDecoder().decode(payload));
@@ -219,6 +236,8 @@ export class LiveKitSession {
    * the `agent.context` participant attribute.
    */
   private manifestManager: ManifestManager | null = null;
+  /** Drops data packets held for not-yet-known senders (set per room). */
+  private _clearEarlyPackets: () => void = () => {};
 
   constructor(options: SessionOptions, callbacks: SessionCallbacks) {
     this.options = options;
@@ -407,6 +426,7 @@ export class LiveKitSession {
       this.manifestManager.stop();
       this.manifestManager = null;
     }
+    this._clearEarlyPackets();
     if (this.room) {
       this.room.disconnect();
       this.room = null;
@@ -484,11 +504,103 @@ export class LiveKitSession {
 
     // Data messages. Ours come from the agent participant with NO topic.
     // The LemonSlice avatar worker publishes its own events on the
-    // `lemonslice` topic (including its own `idle_timeout`), which go to
-    // onAvatarEvent and never reach the agent-command path. Anything
-    // else (another topic, a non-agent sender) is dropped: whatever
-    // reaches onDataMessage can navigate, scroll, click and fill forms
-    // on the host page.
+    // `lemonslice` topic (including its own `idle_timeout`); those go to
+    // onAvatarEvent, only when the avatar sent them, and never reach the
+    // agent-command path. Anything else (another topic, a sender that
+    // is not the agent) is dropped: whatever reaches onDataMessage can
+    // navigate, scroll, click and fill forms on the host page.
+    const warnedSenders = new Set<string>();
+    const warnIgnored = (
+      identity: string,
+      topic: string | undefined,
+      msg: Record<string, unknown>,
+      why: string,
+    ) => {
+      // Once per sender per room: a participant that publishes at a
+      // steady rate (metrics, heartbeats) must not flood the console.
+      if (warnedSenders.has(identity)) return;
+      warnedSenders.add(identity);
+      console.warn(
+        `[LiveLayer] Ignoring data messages ${why}; further messages from this sender are dropped silently`,
+        { from: identity, topic, type: msg.type },
+      );
+    };
+
+    const route = (
+      msg: Record<string, unknown>,
+      sender: RemoteParticipant,
+      topic: string | undefined,
+    ) => {
+      if (topic === AVATAR_DATA_TOPIC) {
+        if (!isAvatarParticipant(sender)) {
+          warnIgnored(sender.identity, topic, msg, "on the avatar topic from a non-avatar sender");
+          return;
+        }
+        this._safely(() =>
+          this.callbacks.onAvatarEvent?.(msg, { topic, participantIdentity: sender.identity }),
+        );
+        return;
+      }
+      if (!isAgentParticipant(sender)) {
+        warnIgnored(sender.identity, topic, msg, "that did not come from the agent");
+        return;
+      }
+      this._safely(() => this._handleAgentMessage(msg));
+    };
+
+    // Packets whose sender livekit-client does not know yet, by identity.
+    type HeldPacket = { msg: Record<string, unknown>; topic?: string };
+    const early = new Map<string, { packets: HeldPacket[]; timer: ReturnType<typeof setTimeout> }>();
+    let earlyCount = 0;
+
+    /**
+     * Replay the packets held for `identity` if the participant is now
+     * known. With `expire`, also give up on a sender that never showed.
+     */
+    const flushEarly = (identity: string, expire = false) => {
+      const held = early.get(identity);
+      if (!held) return;
+      const sender = room.remoteParticipants.get(identity);
+      if (!sender && !expire) return;
+      early.delete(identity);
+      clearTimeout(held.timer);
+      earlyCount -= held.packets.length;
+      if (!sender) {
+        const first = held.packets[0];
+        warnIgnored(identity, first?.topic, first?.msg ?? {}, "from a participant that never joined");
+        return;
+      }
+      for (const p of held.packets) route(p.msg, sender, p.topic);
+    };
+
+    const holdEarly = (
+      identity: string,
+      msg: Record<string, unknown>,
+      topic: string | undefined,
+    ) => {
+      if (earlyCount >= MAX_EARLY_PACKETS) {
+        warnIgnored(identity, topic, msg, "from an unknown participant (too many held)");
+        return;
+      }
+      let held = early.get(identity);
+      if (!held) {
+        held = {
+          packets: [],
+          timer: setTimeout(() => flushEarly(identity, true), EARLY_PACKET_TTL_MS),
+        };
+        early.set(identity, held);
+      }
+      held.packets.push({ msg, topic });
+      earlyCount += 1;
+    };
+
+    const clearEarly = () => {
+      for (const held of early.values()) clearTimeout(held.timer);
+      early.clear();
+      earlyCount = 0;
+    };
+    this._clearEarlyPackets = clearEarly;
+
     room.on(
       RoomEvent.DataReceived,
       (
@@ -499,38 +611,40 @@ export class LiveKitSession {
         _encryptionType?: unknown,
         participantIdentity?: string,
       ) => {
+        if (topic && topic !== AVATAR_DATA_TOPIC) return; // Not ours.
         const msg = parseJsonObject(payload);
         if (!msg) return; // Ignore non-JSON
 
-        const senderIdentity = participant?.identity ?? participantIdentity;
-
-        if (topic === AVATAR_DATA_TOPIC) {
-          this._safely(() =>
-            this.callbacks.onAvatarEvent?.(msg, { topic, participantIdentity: senderIdentity }),
-          );
-          return;
-        }
-        if (topic) return; // Not ours.
-
-        // livekit-client leaves `participant` undefined when the packet
-        // beats the participant's join; resolve it by identity.
-        const sender =
-          participant ??
-          (participantIdentity ? room.remoteParticipants.get(participantIdentity) : undefined);
-        if (!isAgentParticipant(sender)) {
-          console.warn("[LiveLayer] Ignoring a data message that did not come from the agent", {
-            from: senderIdentity,
-            type: msg.type,
-          });
+        if (!participant) {
+          if (participantIdentity) {
+            holdEarly(participantIdentity, msg, topic);
+          } else {
+            warnIgnored("(unknown)", topic, msg, "without a sender");
+          }
           return;
         }
 
-        this._safely(() => this._handleAgentMessage(msg));
+        // Anything held from this sender goes first, to keep order.
+        flushEarly(participant.identity);
+        route(msg, participant, topic);
       },
     );
 
+    // The common case for held packets: the participant update lands
+    // right after the packet.
+    room.on(RoomEvent.ParticipantConnected, (participant: RemoteParticipant) => {
+      flushEarly(participant.identity);
+    });
+    // livekit-client does not emit ParticipantConnected for participants
+    // it learns about while the room is still connecting; check those
+    // once the room is up.
+    room.on(RoomEvent.Connected, () => {
+      for (const identity of [...early.keys()]) flushEarly(identity);
+    });
+
     // Disconnected
     room.on(RoomEvent.Disconnected, () => {
+      clearEarly();
       this.callbacks.onConnectionStateChange("disconnected");
       this.callbacks.onAgentStateChange("idle");
       this.room = null;

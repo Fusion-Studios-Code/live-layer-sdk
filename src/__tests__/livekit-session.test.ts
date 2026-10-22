@@ -121,6 +121,12 @@ function join(room: InstanceType<typeof fake.FakeRoom>, ...ps: FakeParticipant[]
   for (const p of ps) room.remoteParticipants.set(p.identity, p);
 }
 
+/** livekit-client order: add to remoteParticipants, then emit. */
+function arrive(room: InstanceType<typeof fake.FakeRoom>, p: FakeParticipant) {
+  room.remoteParticipants.set(p.identity, p);
+  room.emit(RoomEvent.ParticipantConnected, p);
+}
+
 function leave(
   room: InstanceType<typeof fake.FakeRoom>,
   p: FakeParticipant,
@@ -353,23 +359,47 @@ describe("LiveKitSession — data messages", () => {
     expect(callbacks.onDataMessage).not.toHaveBeenCalled();
   });
 
-  it("ignores messages without a known sender", async () => {
+  it("drops a packet that names no sender at all", async () => {
     const { callbacks, room } = await connectSession();
     join(room, AGENT);
 
     receive(room, packet({ type: "click", selector: "#buy" }), undefined);
-    receive(room, packet({ type: "click", selector: "#buy" }), undefined, undefined, "not-in-room");
 
     expect(callbacks.onDataMessage).not.toHaveBeenCalled();
+    expect(console.warn).toHaveBeenCalledWith(
+      expect.stringContaining("without a sender"),
+      expect.objectContaining({ type: "click" }),
+    );
   });
 
-  it("resolves the agent by participantIdentity when participant is missing", async () => {
+  it("ignores lemonslice-topic packets that do not come from the avatar", async () => {
     const { callbacks, room } = await connectSession();
-    join(room, AGENT);
+    join(room, AGENT, OTHER_USER);
 
-    receive(room, packet({ type: "scroll_page", direction: "down" }), undefined, undefined, AGENT.identity);
+    receive(room, packet({ type: "idle_timeout" }), OTHER_USER, "lemonslice");
+    receive(room, packet({ type: "error", message: "spoofed" }), AGENT, "lemonslice");
 
-    expect(callbacks.onDataMessage).toHaveBeenCalledWith({ type: "scroll_page", direction: "down" });
+    expect(callbacks.onAvatarEvent).not.toHaveBeenCalled();
+    expect(callbacks.onDataMessage).not.toHaveBeenCalled();
+    expect(room.disconnect).not.toHaveBeenCalled();
+  });
+
+  it("warns once per ignored sender, not once per packet", async () => {
+    const { room } = await connectSession();
+    join(room, AGENT, AVATAR, OTHER_USER);
+
+    for (let i = 0; i < 5; i++) receive(room, packet({ type: "metric", i }), AVATAR);
+    for (let i = 0; i < 3; i++) receive(room, packet({ type: "hello", i }), OTHER_USER);
+
+    expect(console.warn).toHaveBeenCalledTimes(2);
+    expect(console.warn).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.objectContaining({ from: AVATAR.identity }),
+    );
+    expect(console.warn).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.objectContaining({ from: OTHER_USER.identity }),
+    );
   });
 
   it("ignores the agent's packets on other topics", async () => {
@@ -405,6 +435,138 @@ describe("LiveKitSession — data messages", () => {
       expect.stringContaining("handler failed"),
       expect.any(Error),
     );
+  });
+});
+
+// ─── DataReceived before the sender's ParticipantInfo ────────────────
+// livekit-client looks the sender up in remoteParticipants and emits
+// DataReceived synchronously, so a packet that beats the participant
+// update arrives with participant === undefined and only the identity.
+
+describe("LiveKitSession — packets that arrive before their sender is known", () => {
+  it("holds an agent packet and replays it when the agent's ParticipantConnected arrives", async () => {
+    const { callbacks, room } = await connectSession();
+    const cmd = { type: "agent_state", state: "speaking" };
+
+    receive(room, packet(cmd), undefined, undefined, AGENT.identity);
+    expect(callbacks.onDataMessage).not.toHaveBeenCalled();
+
+    arrive(room, AGENT);
+
+    expect(callbacks.onDataMessage).toHaveBeenCalledWith(cmd);
+    expect(callbacks.onAgentStateChange).toHaveBeenLastCalledWith("speaking");
+    expect(console.warn).not.toHaveBeenCalled();
+  });
+
+  it("replays held packets before a later packet from the same sender", async () => {
+    const { callbacks, room } = await connectSession();
+
+    receive(room, packet({ type: "step", n: 1 }), undefined, undefined, AGENT.identity);
+    receive(room, packet({ type: "step", n: 2 }), undefined, undefined, AGENT.identity);
+    // Known now, but no ParticipantConnected (e.g. learned while connecting).
+    join(room, AGENT);
+    receive(room, packet({ type: "step", n: 3 }), AGENT);
+
+    expect(callbacks.onDataMessage.mock.calls.map(([m]) => m.n)).toEqual([1, 2, 3]);
+  });
+
+  it("drops held packets when the early sender turns out not to be the agent", async () => {
+    const { callbacks, room } = await connectSession();
+
+    receive(room, packet({ type: "navigate", href: "https://evil.example" }), undefined, undefined, AVATAR.identity);
+    receive(room, packet({ type: "fill_form", fields: {} }), undefined, undefined, OTHER_USER.identity);
+    arrive(room, AVATAR);
+    arrive(room, OTHER_USER);
+
+    expect(callbacks.onDataMessage).not.toHaveBeenCalled();
+    expect(console.warn).toHaveBeenCalledWith(
+      expect.stringContaining("did not come from the agent"),
+      expect.objectContaining({ from: AVATAR.identity, type: "navigate" }),
+    );
+  });
+
+  it("replays a held lemonslice-topic packet to onAvatarEvent once the avatar is known", async () => {
+    const { callbacks, room } = await connectSession();
+
+    receive(room, packet({ type: "bot_ready" }), undefined, "lemonslice", AVATAR.identity);
+    arrive(room, AVATAR);
+
+    expect(callbacks.onAvatarEvent).toHaveBeenCalledWith(
+      { type: "bot_ready" },
+      { topic: "lemonslice", participantIdentity: AVATAR.identity },
+    );
+    expect(callbacks.onDataMessage).not.toHaveBeenCalled();
+  });
+
+  it("replays held packets once the room finishes connecting", async () => {
+    const { callbacks, room } = await connectSession();
+
+    receive(room, packet({ type: "navigate", href: "/a" }), undefined, undefined, AGENT.identity);
+    join(room, AGENT); // learned during connect: no ParticipantConnected
+    room.emit(RoomEvent.Connected);
+
+    expect(callbacks.onDataMessage).toHaveBeenCalledWith({ type: "navigate", href: "/a" });
+  });
+
+  it("does not hold packets on other topics", async () => {
+    const { callbacks, room } = await connectSession();
+
+    receive(room, packet({ type: "navigate", href: "/x" }), undefined, "agent.action", AGENT.identity);
+    arrive(room, AGENT);
+
+    expect(callbacks.onDataMessage).not.toHaveBeenCalled();
+  });
+
+  it("gives up after 5 s on a sender that never joins", async () => {
+    vi.useFakeTimers();
+    const { callbacks, room } = await connectSession();
+
+    receive(room, packet({ type: "click", selector: "#buy" }), undefined, undefined, "ghost");
+    vi.advanceTimersByTime(4_999);
+    expect(console.warn).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(1);
+
+    expect(console.warn).toHaveBeenCalledWith(
+      expect.stringContaining("never joined"),
+      expect.objectContaining({ from: "ghost", type: "click" }),
+    );
+    // Too late: a participant with that identity joining later gets nothing replayed.
+    arrive(room, { ...AGENT, identity: "ghost" });
+    expect(callbacks.onDataMessage).not.toHaveBeenCalled();
+  });
+
+  it("replays at the 5 s mark if the sender became known without an event", async () => {
+    vi.useFakeTimers();
+    const { callbacks, room } = await connectSession();
+
+    receive(room, packet({ type: "scroll_page", direction: "down" }), undefined, undefined, AGENT.identity);
+    join(room, AGENT);
+    vi.advanceTimersByTime(5_000);
+
+    expect(callbacks.onDataMessage).toHaveBeenCalledWith({ type: "scroll_page", direction: "down" });
+  });
+
+  it("holds at most 64 packets", async () => {
+    const { callbacks, room } = await connectSession();
+
+    for (let n = 0; n < 70; n++) receive(room, packet({ type: "step", n }), undefined, undefined, AGENT.identity);
+    arrive(room, AGENT);
+
+    expect(callbacks.onDataMessage).toHaveBeenCalledTimes(64);
+    expect(callbacks.onDataMessage).toHaveBeenLastCalledWith({ type: "step", n: 63 });
+  });
+
+  it("drops held packets when the room disconnects", async () => {
+    vi.useFakeTimers();
+    const { session, callbacks, room } = await connectSession();
+
+    receive(room, packet({ type: "navigate", href: "/x" }), undefined, undefined, AGENT.identity);
+    session.disconnect();
+    arrive(room, AGENT);
+    vi.advanceTimersByTime(10_000);
+
+    expect(callbacks.onDataMessage).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
   });
 });
 
