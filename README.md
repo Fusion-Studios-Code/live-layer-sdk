@@ -122,6 +122,45 @@ Which data messages reach `onDataMessage`: JSON objects published **without a to
 
 `type="password"`, `autocomplete="cc-*"`, and `autocomplete="off"` are ALWAYS excluded by the SDK — even if you accidentally named one of those inputs, the agent still can't fill it. See [docs.livelayer.studio/develop/data-collection](https://docs.livelayer.studio/develop/data-collection) for the full result shape, dashboard-declared field lists, slide-level data collection, capability gating, and webhook delivery.
 
+### Page tools (0.10.0)
+
+The agent's page tools now work with the script tag, without any code on the host page. Before 0.10.0, `<livelayer-widget>` ignored all of the following, so each `get_page_context`, `get_routes` or `submit_form` call waited out the worker's timeout.
+
+| Agent sends | The widget | Reply |
+| --- | --- | --- |
+| `request_page_context` | reads the page: title, URL, visible headings and text, visible links and fields, `data-ll-region` regions, and every `<form>` with its field names, labels, types and HTML5 constraints. **Field values are never read.** | `page_context` |
+| `request_routes` | lists every `<a href>` on the page (deduped, internal or external) | `routes` |
+| `submit_form` | checks HTML5 validation, submits with `requestSubmit()`, and for a form the page handles itself (`preventDefault()`, then `fetch`) watches it for about 2 s: cleared fields, a success message or a removed form mean it went through; a validation error means it did not | `form_submitted`, `form_submit_blocked` or `form_submit_uncertain` |
+| `fill_form` | sets each field the way framework-controlled inputs notice (native setter, then `input` and `change` events) | none |
+| `focus_field` | focuses the field | none |
+| `emit_event` | dispatches `ll-emit-event` on the element, `detail: { eventName, data }`, with HTML stripped from strings | none |
+
+Every reply echoes the request's `requestId`, goes out on the reliable data channel with no topic, and fits one LiveKit data packet: a page context that would not fit is trimmed and lists what was cut in `context.truncated`. Only packets from the agent participant are acted on (see [Headless session](#headless-session-livekitsession)).
+
+The widget also dispatches `ll-<command>` for each of these (for example `ll-fill-form` or `ll-submit-form`, with the command as `detail`), like it does for `ll-navigate`.
+
+```js
+document.querySelector("livelayer-widget").addEventListener("ll-emit-event", (e) => {
+  if (e.detail.eventName === "openPricing") openPricingModal(e.detail.data);
+});
+```
+
+**What the agent can never see or touch:** anything inside `[data-ll-private]` (with or without a value), `[data-ll-skip]` or the widget itself, and `type="password"`, `autocomplete="off"` and `autocomplete="cc-*"` inputs. That covers page text, links, regions, routes and forms alike.
+
+**Capabilities.** Restrict what the agent may do with the `capabilities` attribute, a JSON array or a comma-separated list of `navigate`, `scroll`, `click`, `fill_forms`, `submit_forms`, `read_page` and `collect_data`. Without the attribute everything is allowed.
+
+```html
+<livelayer-widget agent-id="agent_abc" capabilities="navigate,scroll,read_page,fill_forms"></livelayer-widget>
+```
+
+A blocked request is still answered, so the agent can tell the visitor instead of waiting for nothing. The reply has its usual type plus `error: "capability_blocked"`, `capability` and `message`:
+
+- `read_page` blocked: `page_context` carries the refusal in `context` too, and `routes` is `[]`.
+- `submit_forms` blocked: `form_submit_blocked` with `reason: "capability_blocked"`. Nothing is submitted.
+- `fill_forms` blocked: `fill_form` and `focus_field` do nothing.
+
+Not supported with the script tag: multi-step form controls (`advance_step`, `go_back`; the page context has no `flow`), and host callbacks for the page context or routes. Use `@livelayer/react` for those.
+
 ### Visitor Tracker
 
 Track page views, clicks, and custom events with automatic fingerprinting:
@@ -168,6 +207,7 @@ The `<livelayer-widget>` element accepts these attributes:
 | `api-key`   | API key for cross-origin auth. Generate one at `app.livelayer.studio/settings/api-keys`. |
 | `base-url`  | Override the API base URL (default auto-detects from script src)               |
 | `mode`      | Override experience mode: `WIDGET` or `EMBEDDED`                               |
+| `capabilities` | What the agent may do: JSON array or comma-separated list of `navigate`, `scroll`, `click`, `fill_forms`, `submit_forms`, `read_page`, `collect_data`. Default: everything. See [Page tools](#page-tools-0100). |
 
 ## Getting an API key
 
