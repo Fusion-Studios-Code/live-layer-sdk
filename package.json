@@ -1,6 +1,6 @@
 {
   "name": "@livelayer/sdk",
-  "version": "0.9.0",
+  "version": "0.10.0",
   "description": "LiveLayer Agent Widget — drop-in web component for embedding LiveLayer agents",
   "keywords": [
     "livelayer",

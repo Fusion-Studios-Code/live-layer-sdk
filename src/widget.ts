@@ -6,9 +6,10 @@
 import { renderWidget, type WidgetRendererConfig } from "./renderers/widget-renderer";
 import { renderEmbedded, type EmbeddedRendererConfig } from "./renderers/embedded-renderer";
 import { saveSession, loadSession, clearSession } from "./session-persistence";
-import { dispatchAgentEvent, parseDataChannelMessage } from "./event-bridge";
 import { LiveKitSession, type SessionCallbacks, type ConnectionState, type AgentState, type TranscriptEntry } from "./livekit-session";
-import { handleAgentCommand, type AgentCapability } from "./handle-agent-command";
+import { blockedWarn, handleAgentCommand, isAllowed, type AgentCapability } from "./handle-agent-command";
+import { handlePageCommand } from "./page-tools";
+import { agentEventFromCommand } from "./event-bridge";
 
 export { saveSession, loadSession, clearSession } from "./session-persistence";
 export { dispatchAgentEvent, parseDataChannelMessage, sanitize } from "./event-bridge";
@@ -142,6 +143,7 @@ class LiveLayerWidget extends HTMLElementBase {
       "fill_forms",
       "submit_forms",
       "read_page",
+      "collect_data",
     ];
     let arr: string[] = [];
     const trimmed = raw.trim();
@@ -274,6 +276,8 @@ class LiveLayerWidget extends HTMLElementBase {
   }
 
   private _createSession(agentId: string, contentEl: HTMLElement): LiveKitSession {
+    // Assigned below; the callbacks only run once the session exists.
+    let session: LiveKitSession;
     const callbacks: SessionCallbacks = {
       onConnectionStateChange: (state) => {
         this._updateConnectionUI(state, contentEl);
@@ -322,30 +326,55 @@ class LiveLayerWidget extends HTMLElementBase {
       // for phase: "complete" and ship the payload to their backend.
       onDataMessage: (msg) => {
         const cmd = msg as Record<string, unknown>;
-        const handled = handleAgentCommand(cmd, {
-          capabilities: this._capabilities,
-          onTaskFieldUpdated: (detail) => {
-            this.dispatchEvent(
-              new CustomEvent("ll-collected", {
-                bubbles: true,
-                composed: true,
-                detail: { phase: "field", ...detail },
-              }),
-            );
-          },
-          onTaskCompleted: (detail) => {
-            this.dispatchEvent(
-              new CustomEvent("ll-collected", {
-                bubbles: true,
-                composed: true,
-                detail: { phase: "complete", ...detail },
-              }),
-            );
-          },
-        });
+        // 0.10.0 — emit_event → `ll-emit-event` on this element, detail
+        // { eventName, data } with HTML stripped from its strings. No
+        // capability gate, as in @livelayer/react (which hands it to the
+        // host's onAgentCommand).
+        if (cmd.type === "emit_event") {
+          const event = agentEventFromCommand(cmd);
+          if (!event) {
+            console.warn('[LiveLayer] Agent emitted "emit_event" without eventName. Skipping.');
+            return;
+          }
+          this.dispatchEvent(
+            new CustomEvent("ll-emit-event", { bubbles: true, composed: true, detail: event }),
+          );
+          return;
+        }
+        // 0.10.0 — page tools: request_page_context, request_routes and
+        // submit_form are answered on the room the request came from;
+        // fill_form and focus_field act on the host page.
+        const capabilities = this._capabilities;
+        const handled =
+          handlePageCommand(cmd, {
+            isAllowed: (cap) => isAllowed(capabilities, cap),
+            publisher: session.getRoom()?.localParticipant ?? null,
+            warnBlocked: blockedWarn,
+          }) ||
+          handleAgentCommand(cmd, {
+            capabilities,
+            onTaskFieldUpdated: (detail) => {
+              this.dispatchEvent(
+                new CustomEvent("ll-collected", {
+                  bubbles: true,
+                  composed: true,
+                  detail: { phase: "field", ...detail },
+                }),
+              );
+            },
+            onTaskCompleted: (detail) => {
+              this.dispatchEvent(
+                new CustomEvent("ll-collected", {
+                  bubbles: true,
+                  composed: true,
+                  detail: { phase: "complete", ...detail },
+                }),
+              );
+            },
+          });
         if (handled) {
-          // Also dispatch a custom event for host observability — same
-          // pattern as emit_event but for universal commands.
+          // Also dispatch a custom event for host observability, e.g.
+          // `ll-navigate` with the command as detail.
           if (typeof cmd.type === "string") {
             this.dispatchEvent(
               new CustomEvent(`ll-${cmd.type.replace(/_/g, "-")}`, {
@@ -368,10 +397,11 @@ class LiveLayerWidget extends HTMLElementBase {
       },
     };
 
-    return new LiveKitSession(
+    session = new LiveKitSession(
       { agentId, baseUrl: this._baseUrl, apiKey: this._apiKey || undefined },
       callbacks
     );
+    return session;
   }
 
   private _updateConnectionUI(state: ConnectionState, contentEl: HTMLElement): void {

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { sanitize, dispatchAgentEvent, parseDataChannelMessage } from "../event-bridge";
+import { sanitize, dispatchAgentEvent, parseDataChannelMessage, agentEventFromCommand } from "../event-bridge";
 
 describe("event-bridge", () => {
   describe("sanitize", () => {
@@ -121,6 +121,24 @@ describe("event-bridge", () => {
       const result = parseDataChannelMessage(raw);
       expect(result).not.toBeNull();
       expect(result!.data).toEqual({});
+    });
+  });
+
+  describe("agentEventFromCommand", () => {
+    it("returns { eventName, data } with HTML stripped", () => {
+      expect(
+        agentEventFromCommand({
+          type: "emit_event",
+          eventName: "openModal",
+          data: { title: "<b>Hi</b>", n: 2, tags: ["<i>a</i>"] },
+        }),
+      ).toEqual({ eventName: "openModal", data: { title: "Hi", n: 2, tags: ["a"] } });
+    });
+
+    it("defaults data to {} and returns null without an event name", () => {
+      expect(agentEventFromCommand({ type: "emit_event", eventName: "ping" })).toEqual({ eventName: "ping", data: {} });
+      expect(agentEventFromCommand({ type: "emit_event", eventName: "  " })).toBeNull();
+      expect(agentEventFromCommand({ type: "emit_event" })).toBeNull();
     });
   });
 });

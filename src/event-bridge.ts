@@ -74,6 +74,20 @@ export function dispatchAgentEvent(
 }
 
 /**
+ * The AgentEvent an `emit_event` command carries, with HTML stripped
+ * from its strings, or null when the command has no event name.
+ * `data` defaults to {}. Used by <livelayer-widget> to dispatch
+ * `ll-emit-event`.
+ */
+export function agentEventFromCommand(cmd: Record<string, unknown>): AgentEvent | null {
+  const eventName = typeof cmd.eventName === "string" ? cmd.eventName.trim() : "";
+  if (!eventName) return null;
+  const data =
+    cmd.data !== null && typeof cmd.data === "object" ? (cmd.data as Record<string, unknown>) : {};
+  return sanitize({ eventName, data }) as AgentEvent;
+}
+
+/**
  * Parse a raw data channel message into an AgentEvent if it is an
  * emit_event command. Returns null for other message types.
  */

@@ -1,21 +1,34 @@
 // ─── handleAgentCommand ───────────────────────────────────────────────
-// Shared command handler used by BOTH @livelayer/react's <AvatarWidget>
-// AND the @livelayer/sdk's <livelayer-widget> web component. Keeps
-// behavior parity: a fix here lands in both integration modes at once.
+// Command handler for the <livelayer-widget> web component (commands
+// LiveKitSession accepted from the agent participant) and bridge.js
+// (commands relayed by the LiveLayer iframe). @livelayer/react's
+// <AvatarWidget> has its own copy of this logic.
 //
-// Scope (0.5.0):
+// Scope:
 //   - navigate           — anchor click → pushState fallback
 //   - scroll_page        — viewport-relative window scroll
 //   - scroll_to          — scrollIntoView on a selector
 //   - click              — querySelector(selector).click()
+//   - task_field_updated,
+//     task_completed     — structured collection (ll-collected)
 //
-// NOT in this util (currently NPM-package-only via AvatarWidget):
-//   - fill_form, focus_field, submit_form, request_page_context,
-//     request_routes — these involve React-controlled state and DOM
-//     walks that are easier to express in the React component. Future
-//     0.5+ versions will port.
+// The widget handles two more groups before calling this function:
+//   - page tools (request_page_context, request_routes, submit_form,
+//     fill_form, focus_field) in ./page-tools
+//   - emit_event (→ `ll-emit-event`, see agentEventFromCommand in
+//     ./event-bridge)
+// Neither is imported here because bridge.js (the iframe relay) uses
+// this module and must stay small; it relays none of them. (Only the
+// PRIVATE_SUBTREE string comes from ./page-tools/privacy, so `click` and
+// the task painter refuse the same subtrees the page tools do.)
+//
+// NOT handled anywhere: advance_step / go_back (multi-step wizard
+// controls; the page context does not report a `flow`, so the agent has
+// no reason to send them).
 //
 // Design rule: zero React imports. Pure DOM API only. Browser-safe.
+
+import { PRIVATE_SUBTREE } from "./page-tools/privacy";
 
 export type AgentCapability =
   | "navigate"
@@ -110,7 +123,8 @@ const KNOWN_TYPES = new Set([
   "task_completed",
 ]);
 
-function isAllowed(
+/** Whether `cap` is allowed by the allowlist (undefined = everything allowed). */
+export function isAllowed(
   capabilities: AgentCapability[] | undefined,
   cap: AgentCapability,
 ): boolean {
@@ -118,7 +132,7 @@ function isAllowed(
   return capabilities.includes(cap);
 }
 
-function blockedWarn(cmdType: string, cap: string) {
+export function blockedWarn(cmdType: string, cap: string) {
   console.warn(
     `[LiveLayer] Agent command "${cmdType}" blocked — capability "${cap}" not in allowlist. ` +
       "See https://livelayer.studio/docs/react/capabilities",
@@ -316,10 +330,10 @@ export function handleAgentCommand(
       >(`[name="${safeName}"]`);
       targets.forEach((el) => {
         try {
-          // Skip password / cc-* / data-ll-private as a defense in
-          // depth — the agent shouldn't be sending us those, but if
-          // it does, refuse to write into them.
-          if (el.closest('[data-ll-private="true"], [data-ll-skip], .ll-widget')) return;
+          // Skip password / cc-* / off and private subtrees as a
+          // defense in depth — the agent shouldn't be sending us those,
+          // but if it does, refuse to write into them.
+          if (el.closest(PRIVATE_SUBTREE)) return;
           if (el instanceof HTMLInputElement) {
             if (el.type === "password") return;
             const ac = (el.getAttribute("autocomplete") || "").toLowerCase();
@@ -396,7 +410,7 @@ export function handleAgentCommand(
       );
       return true;
     }
-    if (el.closest('[data-ll-private="true"], .ll-widget')) {
+    if (el.closest(PRIVATE_SUBTREE)) {
       console.warn(
         "[LiveLayer] click: refusing to click element inside a private subtree.",
       );

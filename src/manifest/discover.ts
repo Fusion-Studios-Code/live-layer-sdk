@@ -12,8 +12,12 @@
 // Privacy guards (always-on, never overrideable):
 //   - `<input type="password">`
 //   - `[autocomplete=cc-*]` (credit card fields)
-//   - `[data-ll-private]`
-//   - Anything inside `.ll-widget` (the widget's own DOM)
+//   - Anything inside `[data-ll-private]` (any value), `[data-ll-skip]`
+//     or `.ll-widget` (the widget's own DOM): the page tools' rule,
+//     page-tools/privacy.ts PRIVATE_SUBTREE. (Before 0.10 only an input
+//     carrying data-ll-private itself was skipped, so the values of
+//     inputs in a `<form data-ll-skip>` or a private wrapper reached
+//     the agent.)
 //   - Anything with no resolvable label AND no name/id (we'd send a
 //     useless field).
 //
@@ -23,11 +27,11 @@
 // is the "minimal-changes-for-consumers" answer to "do we need
 // onChange per field": no, we just listen at the root.
 
+import { agentText, PRIVATE_SUBTREE } from "../page-tools/privacy";
 import type { FieldKind, FieldManifest, FieldOption } from "./types";
 
 const PRIVACY_BLOCKED_TYPES = new Set(["password", "hidden"]);
 const PRIVACY_BLOCKED_AUTOCOMPLETE_PREFIXES = ["cc-"];
-const WIDGET_DOM_SELECTOR = ".ll-widget";
 
 /** What we discovered. Kept separate from the published manifest so
  * the discovery layer doesn't have to know about transport details. */
@@ -47,15 +51,10 @@ export interface DiscoverOptions {
 
 // ─── Privacy + filter helpers ────────────────────────────────────────
 
-function isWidgetDescendant(el: Element): boolean {
-  return !!el.closest(WIDGET_DOM_SELECTOR);
-}
-
 function isPrivacyBlocked(
   el: HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement,
 ): boolean {
-  if (el.hasAttribute("data-ll-private")) return true;
-  if (isWidgetDescendant(el)) return true;
+  if (el.closest(PRIVATE_SUBTREE)) return true;
   if (el instanceof HTMLInputElement) {
     const type = el.type.toLowerCase();
     if (PRIVACY_BLOCKED_TYPES.has(type)) return true;
@@ -81,14 +80,15 @@ function resolveLabel(
     const lbl = el.ownerDocument.querySelector<HTMLLabelElement>(
       `label[for="${cssEscape(el.id)}"]`,
     );
-    if (lbl?.textContent) return lbl.textContent.trim();
+    // agentText: label text without any private subtree inside it.
+    const text = lbl ? agentText(lbl).trim() : "";
+    if (text) return text;
   }
 
   // 3. Wrapping <label>
   const wrappingLabel = el.closest("label");
-  if (wrappingLabel?.textContent) {
-    // Strip the input's own value/text from the label content
-    const text = wrappingLabel.textContent.trim();
+  if (wrappingLabel) {
+    const text = agentText(wrappingLabel).trim();
     if (text) return text;
   }
 
@@ -98,7 +98,8 @@ function resolveLabel(
   const labelledBy = el.getAttribute("aria-labelledby");
   if (labelledBy) {
     const ref = el.ownerDocument.getElementById(labelledBy);
-    if (ref?.textContent) return ref.textContent.trim();
+    const text = ref ? agentText(ref).trim() : "";
+    if (text) return text;
   }
 
   // 5. Placeholder

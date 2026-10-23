@@ -215,6 +215,34 @@ describe("manifest discover — privacy guards", () => {
     expect(discover()).toEqual([]);
   });
 
+  // The manifest publishes field VALUES, so an opted-out subtree must
+  // keep its inputs out entirely (README: `<form data-ll-skip>` excludes
+  // the whole form).
+  it.each([
+    ["a bare data-ll-private wrapper", "<div data-ll-private>", "</div>"],
+    ['a data-ll-private="true" wrapper', '<div data-ll-private="true">', "</div>"],
+    ["a data-ll-skip form", "<form data-ll-skip>", "</form>"],
+  ])("skips inputs inside %s", (_label, open, close) => {
+    document.body.innerHTML = `
+      ${open}<input name="ssn" value="123-45-6789" />${close}
+      <form><input name="should_keep" /></form>
+    `;
+    const entries = discover();
+    expect(entries.map((e) => e.field.id)).toEqual(["should_keep"]);
+    expect(JSON.stringify(entries.map((e) => e.field))).not.toContain("123-45-6789");
+  });
+
+  it("leaves private text out of a field's label", () => {
+    document.body.innerHTML = `
+      <form>
+        <label for="a">Email for <span data-ll-private>Jane Q. Private</span></label><input id="a" name="a" />
+        <label>Phone <span data-ll-skip>(ends 4471)</span><input name="b" /></label>
+        <span id="t">Notes <b data-ll-private>re: Jane</b></span><input name="c" aria-labelledby="t" />
+      </form>
+    `;
+    expect(discover().map((e) => e.field.label)).toEqual(["Email for", "Phone", "Notes"]);
+  });
+
   it("skips inputs inside .ll-widget (the widget's own DOM)", () => {
     document.body.innerHTML = `
       <div class="ll-widget">
