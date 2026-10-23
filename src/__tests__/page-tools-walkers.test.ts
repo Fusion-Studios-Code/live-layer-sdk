@@ -211,6 +211,118 @@ describe("extractPageContext", () => {
   });
 });
 
+// A private element nested inside an ordinary paragraph, heading, link,
+// label or region is cut out of that element's text; the rest of the
+// text still reaches the agent.
+describe("private content nested inside ordinary elements", () => {
+  it.each([
+    ["bare data-ll-private", "data-ll-private"],
+    ['data-ll-private="true"', 'data-ll-private="true"'],
+    ["data-ll-skip", "data-ll-skip"],
+  ])("cuts a nested %s element out of paragraphs, list items and headings", (_label, attr) => {
+    document.body.innerHTML = `
+      <h2>Welcome back, <span ${attr}>Jane Q. Private</span></h2>
+      <p>Your balance is <span ${attr}>ACCT-99812 $4,210.55</span> today.</p>
+      <ul><li>Order status: shipped <span ${attr}>to 12 Secret Lane</span></li></ul>
+    `;
+    const ctx = extractPageContext();
+    expect(ctx.visibleText.split("\n")).toEqual([
+      "H2: Welcome back,",
+      "Your balance is today.",
+      "Order status: shipped",
+    ]);
+    for (const leak of ["Jane Q. Private", "ACCT-99812", "Secret Lane"]) {
+      expect(JSON.stringify(ctx)).not.toContain(leak);
+    }
+  });
+
+  it("cuts a nested private element out of a region's text", () => {
+    document.body.innerHTML = `
+      <section data-ll-region="account">Account summary <div data-ll-private="true">SSN 123-45-6789</div></section>
+    `;
+    expect(extractPageContext().regions).toEqual([{ id: "account", intent: undefined, text: "Account summary" }]);
+  });
+
+  it("cuts a nested private element out of link text, in the page context and in routes", () => {
+    document.body.innerHTML = `<a href="/me">Profile of <span data-ll-private>Jane Q. Private</span></a>`;
+    expect(extractPageContext().visibleLinks).toEqual([{ href: "/me", text: "Profile of" }]);
+    expect(extractRoutes()).toEqual([{ href: "/me", text: "Profile of", internal: true }]);
+  });
+
+  it("drops a link whose whole text is private from the page context, and lists the route without text", () => {
+    document.body.innerHTML = `<a href="/u/42"><span data-ll-skip>Jane Q. Private</span></a>`;
+    expect(extractPageContext().visibleLinks).toEqual([]);
+    expect(extractRoutes()).toEqual([{ href: "/u/42", text: "", internal: true }]);
+  });
+
+  it("never takes a field label from private text", () => {
+    document.body.innerHTML = `
+      <form id="f">
+        <label for="a">Email for <span data-ll-private>jane@private.example</span></label><input id="a" name="a" />
+        <div data-ll-private><label for="b">Jane's maiden name</label></div><input id="b" name="b" />
+        <label>Phone <span data-ll-skip>(ends 4471)</span><input name="c" /></label>
+      </form>
+    `;
+    const ctx = extractPageContext();
+    expect(ctx.forms[0].fields.map((f) => [f.name, f.label])).toEqual([
+      ["a", "Email for"],
+      ["b", "b"],
+      ["c", "Phone"],
+    ]);
+    expect(ctx.visibleFields.map((f) => f.label)).toEqual(["Email for", "Phone"]);
+    expect(JSON.stringify(ctx)).not.toMatch(/jane@private|maiden|4471/);
+  });
+
+  it.each([
+    [
+      "a heading in a private sibling",
+      `<div><div data-ll-private><h2>Jane Doe medical record</h2></div><form id="f"><input name="a" /></form></div>`,
+      undefined,
+    ],
+    [
+      "a private heading ahead of a public one",
+      `<div><h2 data-ll-skip>Jane Doe billing</h2><h3>Contact us</h3><form id="f"><input name="a" /></form></div>`,
+      "Contact us",
+    ],
+    [
+      "a private aria-labelledby target",
+      `<span id="t" data-ll-private>Jane Doe intake</span><form id="f" aria-labelledby="t"><input name="a" /></form>`,
+      undefined,
+    ],
+    [
+      "a submit button in a private subtree",
+      `<form id="f"><div data-ll-skip><button type="submit">Pay Jane Doe's invoice</button></div><input name="a" /></form>`,
+      undefined,
+    ],
+    [
+      "private text inside a public heading",
+      `<div><h2>Book a call with <span data-ll-private>Jane Doe</span></h2><form id="f"><input name="a" /></form></div>`,
+      "Book a call with",
+    ],
+  ])("never infers a form's intent from %s", (_label, html, intent) => {
+    document.body.innerHTML = html;
+    const forms = extractPageContext().forms;
+    expect(forms.map((f) => [f.id, f.intent])).toEqual([["f", intent]]);
+    expect(JSON.stringify(forms)).not.toContain("Jane Doe");
+  });
+
+  it("leaves a private option out of a select's options", () => {
+    document.body.innerHTML = `
+      <form id="f"><select name="acct">
+        <option value="">Pick an account</option>
+        <option value="chk">Checking</option>
+        <option value="sav" data-ll-private>Savings ending 9981</option>
+      </select></form>
+    `;
+    const field = extractPageContext().forms[0].fields[0];
+    expect(field.options).toEqual([
+      { value: "", label: "Pick an account" },
+      { value: "chk", label: "Checking" },
+    ]);
+    expect(JSON.stringify(field)).not.toContain("9981");
+  });
+});
+
 describe("extractRoutes", () => {
   it("returns a deduped list, internal vs external, with non-navigable hrefs skipped", () => {
     const origin = window.location.origin;

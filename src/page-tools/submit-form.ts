@@ -6,14 +6,21 @@
 // Ported from the `submit_form` branch of @livelayer/react 0.26.0's
 // AvatarWidget.tsx handleDataMessage (github.com/Fusion-Studios-Code/
 // live-layer-react @ a0ac539). Same checks, same timings, same reason
-// codes, with one fix: while watching an SPA submit, a required field
-// that is empty only because the page cleared it is not a validation
-// error (see collectInvalid).
+// codes, with two fixes (see collectInvalid):
+//   - while watching an SPA submit, a required field that is empty only
+//     because the page cleared it is not a validation error;
+//   - a field the agent may not see (privacy.ts: private subtree,
+//     password, autocomplete off / cc-*) is never named in
+//     invalidFields. React sends its label and validationMessage, and in
+//     Chromium that message quotes the typed value ("'jane.example.com'
+//     is missing an '@'") or a password's length. Such a field still
+//     blocks the submit, reported as one PRIVATE_FIELD_INVALID entry.
 //
 // Outcomes:
 //   - native HTML5 constraints unmet before submitting → blocked
-//     (reason "validation", invalidFields "<label>: <message>"); the
-//     form is not submitted.
+//     (reason "validation", invalidFields "<label>: <message>", private
+//     fields folded into PRIVATE_FIELD_INVALID); the form is not
+//     submitted.
 //   - the submit event fires and nothing prevents it (a real POST /
 //     navigation) → submitted.
 //   - the submit event fires and the page's handler calls
@@ -31,7 +38,16 @@
 //   - requestSubmit() throws → blocked ("exception").
 //   - the submit event never fires within 500 ms → blocked ("validation").
 
+import { agentText, isFieldFillable, type FillableEl } from "./privacy";
+
 type FormControl = HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement;
+
+/**
+ * The one invalidFields entry that stands for every failing field the
+ * agent may not see. No label, no message, no count. The worker prints
+ * invalidFields as "Invalid field(s): …".
+ */
+export const PRIVATE_FIELD_INVALID = "a private field you can't see or fill: ask the visitor to check it";
 
 /** First check of an SPA-handled submit, after the page's own handler has had a moment. */
 export const SPA_FIRST_CHECK_MS = 200;
@@ -86,7 +102,8 @@ export function submitForm(
     const id = (el as HTMLElement).id;
     if (id) {
       const lab = form.ownerDocument.querySelector(`label[for="${id.replace(/"/g, '\\"')}"]`);
-      if (lab?.textContent?.trim()) return lab.textContent.trim();
+      const text = lab ? agentText(lab).trim() : "";
+      if (text) return text;
     }
     return el.getAttribute("name") || id || (el as HTMLInputElement).type || "field";
   };
@@ -96,15 +113,21 @@ export function submitForm(
   // cleared it, which is what a successful send does. (React counts it
   // as a validation failure, so a `required` form that resets after a
   // successful SPA submit is reported as blocked.)
+  // Private fields (isFieldFillable false) are folded into one generic
+  // entry, so neither their label nor their validationMessage is sent.
   const collectInvalid = (afterSubmit = false): string[] => {
     try {
-      return Array.from(form.elements)
-        .filter((el) => {
-          const c = el as FormControl;
-          if (!("willValidate" in el) || !c.willValidate || c.checkValidity()) return false;
-          return !(afterSubmit && c.validity?.valueMissing && !c.validity.customError);
-        })
-        .map((el) => `${fieldLabel(el)}: ${(el as FormControl).validationMessage}`);
+      const out: string[] = [];
+      let privateInvalid = false;
+      for (const el of Array.from(form.elements)) {
+        const c = el as FormControl;
+        if (!("willValidate" in el) || !c.willValidate || c.checkValidity()) continue;
+        if (afterSubmit && c.validity?.valueMissing && !c.validity.customError) continue;
+        if (isFieldFillable(el as FillableEl)) out.push(`${fieldLabel(el)}: ${c.validationMessage}`);
+        else privateInvalid = true;
+      }
+      if (privateInvalid) out.push(PRIVATE_FIELD_INVALID);
+      return out;
     } catch {
       return [];
     }

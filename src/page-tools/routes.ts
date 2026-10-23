@@ -9,10 +9,11 @@
 // widget always walks the DOM.
 //
 // Skip rules:
-//   - [data-ll-private] / [data-ll-skip] / .ll-widget subtrees
+//   - [data-ll-private] / [data-ll-skip] / .ll-widget subtrees, and the
+//     same subtrees nested inside a link's text (agentText)
 //   - href that is empty, "#…", "javascript:", "mailto:" or "tel:"
 
-import { hasPrivateAncestor } from "./privacy";
+import { agentText, hasPrivateAncestor } from "./privacy";
 
 const MAX_ROUTES = 200;
 
@@ -60,7 +61,7 @@ export function extractRoutes(doc: Document = document): ExtractedRoute[] {
 
     if (seen.has(href)) continue;
     seen.add(href);
-    out.push({ href, text: (a.textContent || "").trim().slice(0, 120), internal });
+    out.push({ href, text: agentText(a).trim().slice(0, 120), internal });
   }
 
   return out;

@@ -19,9 +19,11 @@
 //   - password / autocomplete="off" / autocomplete="cc-*" inputs are
 //     excluded entirely.
 //   - [data-ll-private], [data-ll-skip] and .ll-widget subtrees are
-//     skipped, for text and links as well as for fields.
+//     skipped, for text and links as well as for fields, including when
+//     they are nested inside an ordinary paragraph, heading, link, label
+//     or region (all text is read through agentText).
 
-import { cssEscape, hasPrivateAncestor, isFieldFillable, isHiddenFromAgent } from "./privacy";
+import { agentText, cssEscape, hasPrivateAncestor, isFieldFillable, isHiddenFromAgent } from "./privacy";
 
 export interface PageContextField {
   /**
@@ -83,7 +85,8 @@ function fieldLabel(el: HTMLElement): string {
   const id = el.getAttribute("id");
   if (id) {
     const lbl = el.ownerDocument.querySelector(`label[for="${cssEscape(id)}"]`);
-    if (lbl?.textContent) return lbl.textContent.trim();
+    const text = lbl ? agentText(lbl) : "";
+    if (text) return text.trim();
   }
   const aria = el.getAttribute("aria-label");
   if (aria) return aria.trim();
@@ -105,7 +108,7 @@ function fieldLabel(el: HTMLElement): string {
         ) {
           continue;
         }
-        const t = (node.textContent || "").trim();
+        const t = agentText(node).trim();
         if (t) parts.push(t);
       }
     }
@@ -133,10 +136,20 @@ export function intentToSlug(intent: string | null): string | null {
   return slug || null;
 }
 
+/** First match of `selector` under `root` outside any private subtree. */
+function firstNotPrivate<T extends Element>(root: ParentNode, selector: string): T | null {
+  for (const el of Array.from(root.querySelectorAll<T>(selector))) {
+    if (!hasPrivateAncestor(el)) return el;
+  }
+  return null;
+}
+
 /**
  * Best-effort intent when the author gave no `data-ll-intent`: the
  * form's aria-label / aria-labelledby, then its submit button text, then
- * the nearest heading among its first four ancestors.
+ * the nearest heading among its first four ancestors. A target, button
+ * or heading in a private subtree is passed over, as if it were not on
+ * the page.
  */
 function inferFormIntent(form: HTMLFormElement): string | null {
   const aria = form.getAttribute("aria-label");
@@ -145,15 +158,16 @@ function inferFormIntent(form: HTMLFormElement): string | null {
   const ariaBy = form.getAttribute("aria-labelledby");
   if (ariaBy) {
     const target = form.ownerDocument.getElementById(ariaBy);
-    if (target?.textContent) return target.textContent.trim().slice(0, 80);
+    const text = target ? agentText(target).trim() : "";
+    if (text) return text.slice(0, 80);
   }
 
-  const submit = form.querySelector<HTMLButtonElement | HTMLInputElement>(
+  const submit = firstNotPrivate<HTMLButtonElement | HTMLInputElement>(
+    form,
     'button[type="submit"], input[type="submit"], button:not([type])',
   );
   if (submit) {
-    const text =
-      submit instanceof HTMLInputElement ? submit.value : (submit.textContent ?? "").trim();
+    const text = submit instanceof HTMLInputElement ? submit.value : agentText(submit).trim();
     if (text && text.length < 60 && !/^(submit|ok|continue)$/i.test(text)) {
       return text;
     }
@@ -161,9 +175,9 @@ function inferFormIntent(form: HTMLFormElement): string | null {
 
   let cur: Element | null = form.parentElement;
   for (let depth = 0; cur && depth < 4; depth++, cur = cur.parentElement) {
-    const heading = cur.querySelector("h1, h2, h3, h4");
-    if (heading?.textContent) {
-      const text = heading.textContent.trim();
+    const heading = firstNotPrivate(cur, "h1, h2, h3, h4");
+    if (heading) {
+      const text = agentText(heading).trim();
       if (text && text.length < 80) return text;
     }
   }
@@ -215,7 +229,7 @@ function describeField(
     const opts: Array<{ value: string; label: string }> = [];
     for (let i = 0; i < el.options.length; i++) {
       const o = el.options[i];
-      if (!o) continue;
+      if (!o || hasPrivateAncestor(o)) continue;
       // A placeholder option (empty value and/or disabled, e.g. "Select a
       // subject…") marks the select as a required choice even without the
       // HTML5 `required` attribute. The select's current value is never
@@ -259,7 +273,7 @@ export function extractPageContext(doc: Document = document): PageContext {
     if (!isVisibleInViewport(el)) continue;
     const id = el.getAttribute("data-ll-region") ?? "";
     const intent = el.getAttribute("data-ll-intent") ?? undefined;
-    const text = clampString((el.innerText || el.textContent || "").trim(), MAX_PARAGRAPH_CHARS * 2);
+    const text = clampString(agentText(el, true).trim(), MAX_PARAGRAPH_CHARS * 2);
     if (!id || !text) continue;
     regions.push({ id, intent, text });
   }
@@ -269,13 +283,13 @@ export function extractPageContext(doc: Document = document): PageContext {
   for (const h of Array.from(doc.querySelectorAll<HTMLElement>("h1, h2, h3, h4, h5, h6"))) {
     if (isHiddenFromAgent(h)) continue;
     if (!isVisibleInViewport(h)) continue;
-    const text = (h.textContent || "").trim();
+    const text = agentText(h).trim();
     if (text) textNodes.push(`${h.tagName}: ${clampString(text, 200)}`);
   }
   for (const p of Array.from(doc.querySelectorAll<HTMLElement>("p, li"))) {
     if (isHiddenFromAgent(p)) continue;
     if (!isVisibleInViewport(p)) continue;
-    const text = (p.textContent || "").trim();
+    const text = agentText(p).trim();
     if (text.length > 10) textNodes.push(clampString(text, MAX_PARAGRAPH_CHARS));
   }
   const visibleText = textNodes.join("\n");
@@ -287,7 +301,7 @@ export function extractPageContext(doc: Document = document): PageContext {
     if (isHiddenFromAgent(a)) continue;
     if (!isVisibleInViewport(a)) continue;
     const href = a.getAttribute("href") || "";
-    const text = (a.textContent || "").trim();
+    const text = agentText(a).trim();
     if (!href || !text) continue;
     visibleLinks.push({ href, text: clampString(text, 100) });
   }

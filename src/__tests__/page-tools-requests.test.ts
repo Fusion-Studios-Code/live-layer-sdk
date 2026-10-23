@@ -10,6 +10,7 @@ import { blockedWarn, isAllowed, type AgentCapability } from "../handle-agent-co
 import { MAX_DATA_PAYLOAD_BYTES } from "../page-tools/data-payload";
 import { clearPageContextCache } from "../page-tools/page-context";
 import { clearRoutesCache } from "../page-tools/routes";
+import { PRIVATE_FIELD_INVALID } from "../page-tools/submit-form";
 import {
   CAPABILITY_BLOCKED,
   READ_PAGE_BLOCKED_MESSAGE,
@@ -331,6 +332,86 @@ describe("submit_form → form_submitted / form_submit_blocked / form_submit_unc
     });
   });
 
+  // invalidFields carries a label and the browser's validationMessage,
+  // which in Chromium quotes the typed value ("'jane.example.com' is
+  // missing an '@'"). A field the agent may not see is never named.
+  describe("invalidFields never describes a field the agent may not see", () => {
+    const privateForm = `
+      <form id="acct">
+        <label for="name">Name</label><input id="name" name="name" required />
+        <div data-ll-private><label for="ssn">Social security number</label><input id="ssn" name="ssn" required /></div>
+        <label for="pw">Password</label><input id="pw" name="pw" type="password" required />
+        <label for="otp">One-time code</label><input id="otp" name="otp" autocomplete="off" required />
+        <label for="cc">Card number</label><input id="cc" name="cc" autocomplete="cc-number" required />
+        <label for="memo">Memo</label><input id="memo" name="memo" data-ll-skip required />
+        <button type="submit">Save</button>
+      </form>
+    `;
+    const hidden = /Social security|ssn|Password|pw:|One-time|otp|Card number|cc:|Memo|memo/;
+
+    it("names the visible field and folds every private one into one generic entry", () => {
+      document.body.innerHTML = privateForm;
+      const { replies } = run({ type: "submit_form", formId: "acct", requestId: "p1" });
+      expect(replies).toHaveLength(1);
+      expect(replies[0]).toMatchObject({ type: "form_submit_blocked", reason: "validation", requestId: "p1" });
+      expect(replies[0].invalidFields).toEqual([expect.stringMatching(/^Name: .+/), PRIVATE_FIELD_INVALID]);
+      expect(JSON.stringify(replies[0])).not.toMatch(hidden);
+    });
+
+    it("still blocks, without naming anything, when only private fields fail", () => {
+      document.body.innerHTML = privateForm;
+      (document.getElementById("name") as HTMLInputElement).value = "Jane";
+      let submits = 0;
+      document.addEventListener("submit", () => submits++);
+      const { replies } = run({ type: "submit_form", formId: "acct", requestId: "p2" });
+      expect(submits).toBe(0);
+      expect(replies).toEqual([
+        {
+          type: "form_submit_blocked",
+          formId: "acct",
+          reason: "validation",
+          invalidFields: [PRIVATE_FIELD_INVALID],
+          requestId: "p2",
+        },
+      ]);
+    });
+
+    it("hides a private field's error that appears while an SPA submit is watched", async () => {
+      vi.useFakeTimers();
+      document.body.innerHTML = `
+        <form id="acct">
+          <input name="name" value="Jane" />
+          <div data-ll-skip><label for="ref">Account</label><input id="ref" name="ref" value="ACCT-99812" /></div>
+        </form>
+      `;
+      const ref = document.getElementById("ref") as HTMLInputElement;
+      document.getElementById("acct")!.addEventListener("submit", (e) => {
+        e.preventDefault();
+        setTimeout(() => ref.setCustomValidity("Account ACCT-99812 is locked"), 50);
+      });
+      const { replies } = run({ type: "submit_form", formId: "acct", requestId: "p3" });
+      await vi.advanceTimersByTimeAsync(250);
+      expect(replies).toEqual([
+        {
+          type: "form_submit_blocked",
+          formId: "acct",
+          reason: "validation",
+          invalidFields: [PRIVATE_FIELD_INVALID],
+          requestId: "p3",
+        },
+      ]);
+    });
+
+    it("leaves private text out of a visible field's label", () => {
+      document.body.innerHTML = `
+        <form id="c"><label for="e">Email for <span data-ll-private>Jane Q. Private</span></label><input id="e" name="e" required /></form>
+      `;
+      const { replies } = run({ type: "submit_form", formId: "c", requestId: "p4" });
+      expect(replies[0].invalidFields).toEqual([expect.stringMatching(/^Email for: .+/)]);
+      expect(JSON.stringify(replies[0])).not.toContain("Jane Q. Private");
+    });
+  });
+
   it("blocks with reason exception when requestSubmit throws", () => {
     document.body.innerHTML = contactForm;
     fill();
@@ -394,7 +475,9 @@ describe("submit_form → form_submitted / form_submit_blocked / form_submit_unc
         type: "form_submit_blocked",
         formId: "contact",
         reason: CAPABILITY_BLOCKED,
-        invalidFields: [],
+        // The worker (ec34f9b3) prints invalidFields but not `message`,
+        // so the refusal rides there too (it adds the final period).
+        invalidFields: [SUBMIT_BLOCKED_MESSAGE.slice(0, -1)],
         error: CAPABILITY_BLOCKED,
         capability: "submit_forms",
         message: SUBMIT_BLOCKED_MESSAGE,

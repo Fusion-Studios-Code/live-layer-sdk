@@ -24,9 +24,11 @@
 //
 //   page_context: the refusal is repeated inside `context`, because the
 //                 worker hands `context` to the LLM verbatim.
-//   routes:       `routes: []`.
+//   routes:       `routes: []` (the worker shows the LLM only the list,
+//                 so this refusal is not visible there yet).
 //   submit:       type form_submit_blocked, reason "capability_blocked",
-//                 invalidFields [].
+//                 and the message as the one invalidFields entry, which
+//                 the worker does print ("Invalid field(s): …").
 //
 // The behaviour is ported from @livelayer/react 0.26.0's AvatarWidget
 // (github.com/Fusion-Studios-Code/live-layer-react @ a0ac539); see each
@@ -197,7 +199,8 @@ export function handlePageCommand(
         type: "form_submit_blocked",
         formId,
         reason: CAPABILITY_BLOCKED,
-        invalidFields: [],
+        // The worker adds the final period.
+        invalidFields: [SUBMIT_BLOCKED_MESSAGE.replace(/\.$/, "")],
         ...refusal("submit_forms", SUBMIT_BLOCKED_MESSAGE),
       });
       return true;

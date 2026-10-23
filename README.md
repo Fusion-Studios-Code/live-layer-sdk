@@ -145,7 +145,9 @@ document.querySelector("livelayer-widget").addEventListener("ll-emit-event", (e)
 });
 ```
 
-**What the agent can never see or touch:** anything inside `[data-ll-private]` (with or without a value), `[data-ll-skip]` or the widget itself, and `type="password"`, `autocomplete="off"` and `autocomplete="cc-*"` inputs. That covers page text, links, regions, routes and forms alike.
+**What the agent can never see or touch:** anything inside `[data-ll-private]` (with or without a value), `[data-ll-skip]` or the widget itself, and `type="password"`, `autocomplete="off"` and `autocomplete="cc-*"` inputs. That covers page text, links, regions, routes and forms, and the agent's `click` and data-collection writes too. A private element nested inside an ordinary paragraph, heading, link, label or region is cut out of that element's text. A private field that fails validation still blocks `submit_form`, but it is reported as one generic entry, without its label or the browser's message (which can quote what the visitor typed).
+
+One exception: the form manifest (`automanifest`, on by default) still reports `autocomplete="off"` fields, values included. Put `data-ll-private` on such a field to keep it out.
 
 **Capabilities.** Restrict what the agent may do with the `capabilities` attribute, a JSON array or a comma-separated list of `navigate`, `scroll`, `click`, `fill_forms`, `submit_forms`, `read_page` and `collect_data`. Without the attribute everything is allowed.
 
@@ -156,7 +158,7 @@ document.querySelector("livelayer-widget").addEventListener("ll-emit-event", (e)
 A blocked request is still answered, so the agent can tell the visitor instead of waiting for nothing. The reply has its usual type plus `error: "capability_blocked"`, `capability` and `message`:
 
 - `read_page` blocked: `page_context` carries the refusal in `context` too, and `routes` is `[]`.
-- `submit_forms` blocked: `form_submit_blocked` with `reason: "capability_blocked"`. Nothing is submitted.
+- `submit_forms` blocked: `form_submit_blocked` with `reason: "capability_blocked"` and the message as its one `invalidFields` entry. Nothing is submitted.
 - `fill_forms` blocked: `fill_form` and `focus_field` do nothing.
 
 Not supported with the script tag: multi-step form controls (`advance_step`, `go_back`; the page context has no `flow`), and host callbacks for the page context or routes. Use `@livelayer/react` for those.
